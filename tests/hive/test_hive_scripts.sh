@@ -13,6 +13,7 @@ mkdir -p "$BLOX_DIR"
 cp "$PKGSRC"/h-config.sh "$PKGSRC"/h-stats.sh "$BLOX_DIR"/
 sed -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/config.json#" \
     -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/log/bloxminer-x#" "$PKGSRC/h-manifest.conf" > "$BLOX_DIR/h-manifest.conf"
+mkdir -p "$T/log"   # h-run.sh creates this in production before the miner (and h-stats.sh) ever runs
 CONF=$T/config.json
 : > "$BLOX_DIR/xmrig"; chmod +x "$BLOX_DIR/xmrig"     # placeholder: only its path is ever compared, never run
 
@@ -94,6 +95,27 @@ check_fail "1gb-pages: non-boolean rejected" "\"1gb-pages\" must be true or fals
 hc "p:1" "W.rig" "" "" '"randomx": {"rdmsr": false}, "1gb-pages": true'
 check_cfg "randomx object merges alongside 1gb-pages handling" '.randomx.rdmsr == false'
 
+# ---- nested "randomx": {"1gb-pages": ...} must go through the SAME NUMA gate as the top-level key (no bypass)
+rm -rf "$T_SYS"; setnode 0 $((4 * 1024 * 1024)); setnode 1 $((5 * 1024 * 1024))
+BLOX_SYSFS_ROOT=$T_SYS hc "p:1" "W.rig" "" "" '"randomx": {"1gb-pages": true, "rdmsr": false}'
+check_cfg "nested 1gb-pages: enough memory -> enabled, sibling randomx keys kept" '.randomx."1gb-pages" == true and .randomx.rdmsr == false'
+rm -rf "$T_SYS"; setnode 0 $((1 * 1024 * 1024))
+BLOX_SYSFS_ROOT=$T_SYS hc "p:1" "W.rig" "" "" '"randomx": {"1gb-pages": true}'
+check_cfg "nested 1gb-pages: short on memory -> dropped, cannot bypass the gate" '(.randomx | has("1gb-pages")) | not'
+BLOX_SYSFS_ROOT=$T_SYS hc "p:1" "W.rig" "" "" '"randomx": {"1gb-pages": "true"}'
+check_fail "nested 1gb-pages: non-boolean rejected" "\"1gb-pages\" must be true or false"
+
+# ---- cpu.huge-pages is forced the same way cpu.enabled is - Extra config cannot turn it off
+hc "p:1" "W.rig" "" "" '"cpu": {"huge-pages": false, "max-threads-hint": 8}'
+check_cfg "cpu.huge-pages forced true even when Extra sets it false" '.cpu."huge-pages" == true and .cpu."max-threads-hint" == 8'
+check_out "cpu.huge-pages ignored message" "cpu.huge-pages"
+
+# ---- print-time (and other non-protected defaults) are overridable by Extra config
+hc "p:1" "W.rig" "" "" '"print-time": 30'
+check_cfg "Extra config print-time survives" '."print-time" == 30'
+hc "p:1" "W.rig" "" "" ''
+check_cfg "print-time default is 60" '."print-time" == 60'
+
 # ---- malformed Extra config leaves the old config intact, no temp file left behind
 echo '{"old":true}' > "$CONF"
 hc "p:1" "W.rig" "" "" 'not json at all'
@@ -145,16 +167,17 @@ EOF
 	chmod +x "$BLOX_DIR/bloxsense"
 }
 
-fake_topo_json() {   # $1 = number of physical cores; two threads per core (SMT), cpu i and cpu i+ncores share core i
-	local n=$1
-	python3 - "$n" <<'PY'
+fake_topo_json() {   # $1 = number of physical cores (two threads per core, SMT: cpu i and cpu i+ncores share core i)
+                      # $2 = power_w (default 95.0), may be fractional
+	local n=$1 p=${2:-95.0}
+	python3 - "$n" "$p" <<'PY'
 import json, sys
-n = int(sys.argv[1])
+n, p = int(sys.argv[1]), float(sys.argv[2])
 cpus = []
 for c in range(2 * n):
 	core = c % n
 	cpus.append({"cpu": c, "pkg": 0, "core": core, "temp": 55 + core, "src": "core"})
-print(json.dumps({"cpus": cpus, "pkg_temp": 70, "power_w": 95.0, "ccd_reason": "test fixture"}))
+print(json.dumps({"cpus": cpus, "pkg_temp": 70, "power_w": p, "ccd_reason": "test fixture"}))
 PY
 }
 
@@ -191,7 +214,7 @@ task "tmgmt" "0-31"   # a management thread keeping the full mask must not confu
 bloxsense_says "$(fake_topo_json 16)"
 stats_case "per-core grouping, 16C/32T, bound and verified" 20001 "$SUM_OK" "$BACK_16C32T" \
 	'(.stats.hs | length) == 16 and .stats.uptime == 321 and .stats.ar == [15, 1] and .stats.cpu_power == 95 and
-	 .stats.ver == "1.0.0 (xmrig 6.26.0)" and .stats.algo == "rx/0" and
+	 .stats.ver == "bloxminer-x 1.0.0 (xmrig 6.26.0)" and .stats.algo == "rx/0" and
 	 (.stats.hs[0] == (((100 + 0) * 10 + (100 + 16) * 10) / 1000)) and (.stats.temp[0] == 55)'
 
 BACK_NULLS=$(python3 - <<'PY'
@@ -254,7 +277,59 @@ stats_case "numeric JSON types throughout" 20009 "$SUM_OK" "$BACK_NULLS" \
 	'(.stats.ar | map(type) | unique) == ["number"] and (.stats.uptime | type) == "number" and
 	 (.stats.hs | map(type) | unique) == ["number"] and (.khs | type) == "string" and (.khs | tonumber | type) == "number"'
 
-# ---- budget: a slow sensor tool must not block past its own timeout, and the total stays well under 5 s
+reset_proc; listen 20011 1011 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4 95.5)"
+stats_case "fractional power_w (95.5) is not dropped" 20011 "$SUM_OK" "$BACK_NULLS" '.stats.cpu_power == 95.5'
+
+BACK_BAD_TYPES=$(python3 - <<'PY'
+import json
+threads = [{"affinity": str(c), "hashrate": [1000.0, None, None]} for c in range(4)]   # affinity is a STRING
+print(json.dumps([{"type": "cpu", "threads": threads}]))
+PY
+)
+reset_proc; listen 20012 1012 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+stats_case "malformed JSON types (affinity as string) -> full fallback" 20012 "$SUM_OK" "$BACK_BAD_TYPES" \
+	'.khs == "0" and .stats.hs == [0]'
+
+BACK_NO_HASHRATE_ARRAY=$(jq -nc '[{"type": "cpu", "threads": [{"affinity": 0, "hashrate": "not-an-array"}]}]')
+reset_proc; listen 20013 1013 "$BLOX_DIR/xmrig"; task "t0" "0"
+bloxsense_says "$(fake_topo_json 4)"
+stats_case "malformed JSON types (hashrate not an array) -> full fallback" 20013 "$SUM_OK" "$BACK_NO_HASHRATE_ARRAY" \
+	'.khs == "0" and .stats.hs == [0]'
+
+BACK_NEGATIVE=$(python3 - <<'PY'
+import json
+threads = [{"affinity": c, "hashrate": [1000.0, None, None]} for c in range(4)]
+threads[1]["hashrate"][0] = -500.0   # one bad rate must clamp to 0, never go negative, and must not poison the others
+print(json.dumps([{"type": "cpu", "threads": threads}]))
+PY
+)
+reset_proc; listen 20014 1014 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+stats_case "negative rate clamps to 0 for that row, others unaffected" 20014 "$SUM_OK" "$BACK_NEGATIVE" \
+	'.stats.hs == [1, 0, 1, 1] and .khs == "3.00"'
+
+BACK_NO_THREADS_KEY=$(jq -nc '[{"type": "cpu", "algo": null}]')   # legitimate: before the first pool job, no "threads" key at all
+reset_proc; listen 20015 1015 "$BLOX_DIR/xmrig"
+bloxsense_says "$(fake_topo_json 4)"
+stats_case "cpu backend with no threads key yet (pre-first-job) -> hs [0], khs 0" 20015 "$SUM_OK" "$BACK_NO_THREADS_KEY" \
+	'.khs == "0" and .stats.hs == [0]'
+
+# ---- budget: ONE shared 3.0 s deadline - a slow step gets whatever is left, never more, and the whole run
+#      (ownership check + both curls + bloxsense) stays comfortably under 3.2 s wall time even in bad cases.
+run_hstats_timed() {   # -> sets $res $elapsed (wall time, seconds)
+	local a b
+	a=$(date +%s.%N)
+	# shellcheck disable=SC2016   # $BLOX_DIR/$khs/$stats are meant to expand inside the inner bash -c, not here
+	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+	b=$(date +%s.%N)
+	elapsed=$(awk -v x="$a" -v y="$b" 'BEGIN{printf "%.2f", y - x}')
+}
+under_budget() { awk -v e="$1" 'BEGIN{exit !(e < 3.2)}'; }
+
+# slow bloxsense (sleeps 5 s), fast/normal API: bloxsense is killed at whatever remains of the shared budget
+# (not a fixed 1.8 s), so the total still stays under 3.2 s
 reset_proc; listen 20010 1010 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 cat > "$BLOX_DIR/bloxsense" <<'EOF'
 #!/bin/sh
@@ -262,23 +337,84 @@ sleep 5
 echo '{"cpus":[],"pkg_temp":null,"power_w":null,"ccd_reason":"slow"}'
 EOF
 chmod +x "$BLOX_DIR/bloxsense"
-kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
 : > "$T/api.out"
 python3 "$HERE/fake_xmrig_api.py" 20010 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 export BLOX_API_PORT=20010
-t0=$(date +%s.%N)
-# shellcheck disable=SC2016   # $BLOX_DIR/$khs/$stats are meant to expand inside the inner bash -c, not here
-res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
-t1=$(date +%s.%N)
-elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
-if awk -v e="$elapsed" 'BEGIN{exit !(e < 4.5)}' && [[ $(jq -r '(.stats.temp | unique) == [null]' <<< "$res" 2>/dev/null) == true ]]; then
-	ok "budget: slow bloxsense capped by its own timeout (${elapsed}s)"
+run_hstats_timed
+if under_budget "$elapsed" && [[ $(jq -r '(.stats.temp | unique) == [null]' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "budget: slow bloxsense capped by the remaining shared budget (${elapsed}s)"
 else
-	bad "budget: slow bloxsense capped by its own timeout" "elapsed=${elapsed}s $res"
+	bad "budget: slow bloxsense capped by the remaining shared budget" "elapsed=${elapsed}s $res"
+fi
+
+# a hanging/very slow API (10 s reply delay) AND a slow bloxsense together: the first curl consumes nearly the
+# whole shared budget, so backends/bloxsense are skipped outright rather than each getting their own fresh
+# allowance - the combined worst case still stays under 3.2 s and falls back cleanly (khs 0, hs [0])
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" --argjson d 10 '{summary: $s, backends: $b, delay: $d}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20016 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+reset_proc; listen 20016 1016 "$BLOX_DIR/xmrig"
+export BLOX_API_PORT=20016
+run_hstats_timed
+if under_budget "$elapsed" && [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "budget: hanging API + slow bloxsense together still fall back under 3.2 s (${elapsed}s)"
+else
+	bad "budget: hanging API + slow bloxsense together still fall back under 3.2 s" "elapsed=${elapsed}s $res"
 fi
 bloxsense_says "$(fake_topo_json 4)"   # restore a fast bloxsense for anything after this point
+
+# ================================================================== diagnostics: one log line per state change
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PKG2="$T/pkg2"; mkdir -p "$PKG2" "$T/log2"
+cp "$BLOX_DIR/h-config.sh" "$BLOX_DIR/h-stats.sh" "$PKG2/"
+ln -sf "$BLOX_DIR/xmrig" "$PKG2/xmrig"
+ln -sf "$BLOX_DIR/bloxsense" "$PKG2/bloxsense"   # bloxsense_says() below keeps controlling both via this symlink
+sed -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/config2.json#" \
+    -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/log2/bloxminer-x#" "$BLOX_DIR/h-manifest.conf" > "$PKG2/h-manifest.conf"
+jq -n '{pools: [{algo: "rx/0"}]}' > "$T/config2.json"
+STATE2="$T/state2"; LOG2="$T/log2/bloxminer-x.log"
+run_pkg2() { mkdir -p "$STATE2" "$T/log2"; BLOX_DIR=$PKG2 BLOX_STATE_DIR=$STATE2 BLOX_API_PORT=$1 BLOX_PROCFS_ROOT=$PROC \
+	bash -c '. "$BLOX_DIR/h-stats.sh"' > /dev/null 2>&1; }
+loglines() { grep -c "$1" "$LOG2" 2>/dev/null || true; }
+
+rm -rf "$STATE2" "$T/log2"; reset_proc   # nothing listening: unavailable
+run_pkg2 20020
+if [[ $(loglines "stats API unavailable") == 1 ]]; then ok "state log: first unavailable is logged once"; else bad "state log: first unavailable is logged once" "$(cat "$LOG2" 2>/dev/null)"; fi
+run_pkg2 20020   # still down: no duplicate line
+if [[ $(loglines "stats API unavailable") == 1 ]]; then ok "state log: repeated unavailable is not re-logged"; else bad "state log: repeated unavailable is not re-logged" "$(cat "$LOG2" 2>/dev/null)"; fi
+
+reset_proc; listen 20021 1021 "$PKG2/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20021 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+run_pkg2 20021   # recovered: verified per-core rows again
+if [[ $(loglines "recovered") == 1 && $(loglines "stats API unavailable") == 1 ]]; then ok "state log: recovery from unavailable is logged once"; else bad "state log: recovery from unavailable is logged once" "$(cat "$LOG2" 2>/dev/null)"; fi
+
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc; listen 20022 1022 "$PKG2/xmrig"   # no tasks set up: affinity present but never independently confirmed
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20022 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+run_pkg2 20022
+if [[ $(loglines "affinity not verified") == 1 ]]; then ok "state log: unverified transition is logged once"; else bad "state log: unverified transition is logged once" "$(cat "$LOG2" 2>/dev/null)"; fi
+run_pkg2 20022   # still unverified: no duplicate
+if [[ $(loglines "affinity not verified") == 1 ]]; then ok "state log: repeated unverified is not re-logged"; else bad "state log: repeated unverified is not re-logged" "$(cat "$LOG2" 2>/dev/null)"; fi
+
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc; listen 20023 1023 "$PKG2/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20023 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+run_pkg2 20023   # recovered again, from unverified this time
+if [[ $(loglines "recovered") == 2 ]]; then ok "state log: recovery from unverified is logged once"; else bad "state log: recovery from unverified is logged once" "$(cat "$LOG2" 2>/dev/null)"; fi
+
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc   # a transition-worthy run (unavailable), captured without discarding stdout this time
+stdout_out=$(BLOX_DIR=$PKG2 BLOX_STATE_DIR=$STATE2 BLOX_API_PORT=20024 BLOX_PROCFS_ROOT=$PROC bash -c '. "$BLOX_DIR/h-stats.sh"' 2>/dev/null)
+if [[ -z $stdout_out ]]; then ok "state log: nothing is ever printed to stdout"; else bad "state log: nothing is ever printed to stdout" "stdout=$stdout_out"; fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

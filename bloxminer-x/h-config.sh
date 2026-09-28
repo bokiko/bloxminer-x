@@ -5,18 +5,21 @@
 #   CUSTOM_TEMPLATE    wallet(.worker) template, e.g. %WAL%.%WORKER_NAME% -> pools[0].user
 #   CUSTOM_PASS        pool password (NOT a thread count - this differs from the Verus BloxMiner) -> pools[0].pass
 #   CUSTOM_ALGO        RandomX variant: rx/0, rx/wow, rx/arq, rx/graft, rx/sfx or rx/yada; empty = rx/0
-#   CUSTOM_USER_CONFIG optional JSON members, merged into the top-level config, e.g. "print-time": 30
+#   CUSTOM_USER_CONFIG optional JSON members, merged into defaults (print-time, colors) before the fixed/
+#                      protected settings, e.g. "print-time": 30
 #                      "tls": true            - force TLS on the pool connection (stratum+ssl:// already does)
-#                      "1gb-pages": true      - opt-in only; needs >= 3 GiB free per NUMA node (checked below),
-#                                               dropped with a message otherwise
-#                      "cpu": {...}           - merged into the cpu object (huge-pages/enabled stay fixed)
+#                      "1gb-pages": true      - opt-in only, top-level OR nested "randomx": {"1gb-pages": true} -
+#                                               both forms go through the same >= 3 GiB-free-per-NUMA-node check
+#                                               below; dropped with a message otherwise
+#                      "cpu": {...}           - merged into the cpu object; "enabled" and "huge-pages" are
+#                                               always forced by BloxMiner-X regardless of what Extra config sets
 # Threads are XMRig's own cache-aware autoconfig; Extra config can steer them via "cpu": {"max-threads-hint": N}
 # or "cpu": {"rx": [...]} (XMRig's own keys, passed through as-is).
 . "${BLOX_DIR:-/hive/miners/custom/bloxminer-x}/h-manifest.conf"   # BLOX_DIR: tests only
 SYSROOT=${BLOX_SYSFS_ROOT:-}                                       # /sys path prefix; tests only
 
 # top-level Extra config keys BloxMiner-X always sets itself (0% fee, local read-only API, our own log file);
-# "cpu.enabled" is protected the same way but lives one level down and is handled separately below.
+# "cpu.enabled"/"cpu.huge-pages" are protected the same way but live one level down and are handled separately.
 PROTECTED='["donate-level","donate-over-proxy","http","api","autosave","log-file","background","syslog","opencl","cuda"]'
 ALGOS='["rx/0","rx/wow","rx/arq","rx/graft","rx/sfx","rx/yada"]'
 
@@ -46,52 +49,66 @@ if jq -e 'has("tls")' <<< "$extra" > /dev/null; then
 fi
 
 # "1gb-pages": opt-in only, and only when every NUMA node reports >= 3 GiB free right now (XMRig reserves the
-# pages itself at startup via sysfs; a failed reservation silently falls back to 2 MB pages).
-onegb=false
-if jq -e 'has("1gb-pages")' <<< "$extra" > /dev/null; then
-	v=$(jq -r '."1gb-pages" | if type == "boolean" then tostring else "(\(type))" end' <<< "$extra")
+# pages itself at startup via sysfs; a failed reservation silently falls back to 2 MB pages). Both the
+# top-level key and the nested "randomx": {"1gb-pages": ...} form are read here and go through this ONE gate;
+# the nested form is then stripped out of $xrx below so it can never re-enter the config unchecked.
+onegb_req=false
+check_onegb_bool() {   # $1 = the "1gb-pages" value found (top-level or nested), fails on anything but a boolean
+	local v; v=$(jq -r 'if type == "boolean" then tostring else "(\(type))" end' <<< "$1")
 	[[ $v == true || $v == false ]] || fail "BloxMiner-X: Extra config \"1gb-pages\" must be true or false (got $v)"
-	if [[ $v == true ]]; then
-		nodes=("$SYSROOT"/sys/devices/system/node/node[0-9]*/meminfo)
-		if [[ ! -e ${nodes[0]} ]]; then
-			echo "BloxMiner-X: Extra config \"1gb-pages\" ignored: no NUMA memory information to verify 3 GiB/node"
+	[[ $v == true ]]
+}
+if jq -e 'has("1gb-pages")' <<< "$extra" > /dev/null; then
+	check_onegb_bool "$(jq -c '."1gb-pages"' <<< "$extra")" && onegb_req=true
+fi
+if jq -e '(.randomx // {}) | has("1gb-pages")' <<< "$extra" > /dev/null; then
+	check_onegb_bool "$(jq -c '.randomx."1gb-pages"' <<< "$extra")" && onegb_req=true
+fi
+onegb=false
+if [[ $onegb_req == true ]]; then
+	nodes=("$SYSROOT"/sys/devices/system/node/node[0-9]*/meminfo)
+	if [[ ! -e ${nodes[0]} ]]; then
+		echo "BloxMiner-X: Extra config \"1gb-pages\" ignored: no NUMA memory information to verify 3 GiB/node"
+	else
+		short=""
+		for f in "${nodes[@]}"; do
+			kb=$(sed -n 's/.*MemFree:[[:space:]]*\([0-9]\+\) kB/\1/p' "$f")
+			[[ $kb =~ ^[0-9]+$ ]] && (( kb >= 3 * 1024 * 1024 )) || short+="${short:+, }$(basename "$(dirname "$f")")"
+		done
+		if [[ -n $short ]]; then
+			echo "BloxMiner-X: Extra config \"1gb-pages\" ignored: < 3 GiB free on $short"
 		else
-			short=""
-			for f in "${nodes[@]}"; do
-				kb=$(sed -n 's/.*MemFree:[[:space:]]*\([0-9]\+\) kB/\1/p' "$f")
-				[[ $kb =~ ^[0-9]+$ ]] && (( kb >= 3 * 1024 * 1024 )) || short+="${short:+, }$(basename "$(dirname "$f")")"
-			done
-			if [[ -n $short ]]; then
-				echo "BloxMiner-X: Extra config \"1gb-pages\" ignored: < 3 GiB free on $short"
-			else
-				onegb=true
-			fi
+			onegb=true
 		fi
 	fi
 fi
 
-# cpu.enabled is protected (BloxMiner-X always enables the CPU backend); everything else under "cpu" passes through
+# cpu.enabled and cpu.huge-pages are protected (BloxMiner-X always enables the CPU backend with huge pages);
+# everything else under "cpu" passes through
 xcpu=$(jq -c '.cpu // {}' <<< "$extra")
-if jq -e 'has("enabled")' <<< "$xcpu" > /dev/null; then
-	echo "BloxMiner-X: Extra config key ignored (set by BloxMiner-X): cpu.enabled"
-	xcpu=$(jq -c 'del(.enabled)' <<< "$xcpu")
-fi
+cpu_ignored=$(jq -r '[if has("enabled") then "cpu.enabled" else empty end,
+                      if has("huge-pages") then "cpu.huge-pages" else empty end] | join(", ")' <<< "$xcpu")
+[[ -n $cpu_ignored ]] && echo "BloxMiner-X: Extra config keys ignored (set by BloxMiner-X): $cpu_ignored"
+xcpu=$(jq -c 'del(.enabled, ."huge-pages")' <<< "$xcpu")
 
 ignored=$(jq -r --argjson p "$PROTECTED" '[keys[] | select(. as $k | $p | index($k))] | join(", ")' <<< "$extra")
 [[ -n $ignored ]] && echo "BloxMiner-X: Extra config keys ignored (set by BloxMiner-X): $ignored"
+# $rest: permitted Extra config, applied as an override of the defaults below but never of the protected/fixed
+# block that follows it (cpu/randomx/pools and the PROTECTED list are always forced, applied last)
 rest=$(jq -c --argjson p "$PROTECTED" 'with_entries(select(.key as $k | $p | index($k) | not)) | del(.cpu, .tls, ."1gb-pages", .randomx)' <<< "$extra")
-xrx=$(jq -c '.randomx // {}' <<< "$extra")
+xrx=$(jq -c '(.randomx // {}) | del(."1gb-pages")' <<< "$extra")
 
 # write next to the target, validate, then rename: a failure never leaves an empty or partial config
 tmp="$CUSTOM_CONFIG_FILENAME.tmp.$$"
 if jq -n --arg url "$url" --arg user "$CUSTOM_TEMPLATE" --arg pass "${CUSTOM_PASS:-x}" --arg algo "$algo" \
 	--argjson tls "$tls_json" --argjson rest "$rest" --argjson xcpu "$xcpu" --argjson xrx "$xrx" \
 	--argjson onegb "$onegb" --arg log "$CUSTOM_LOG_BASENAME.log" \
-	'$rest
-	 + {cpu: ({enabled: true, "huge-pages": true} + $xcpu),
+	'{colors: true, "print-time": 60}
+	 + $rest
+	 + {cpu: ($xcpu + {enabled: true, "huge-pages": true}),
 	    randomx: ($xrx + (if $onegb then {"1gb-pages": true} else {} end)),
 	    "donate-level": 0, "donate-over-proxy": 0, "autosave": false, "background": false, "syslog": false,
-	    colors: true, "print-time": 60, "log-file": $log,
+	    "log-file": $log,
 	    http: {enabled: true, host: "127.0.0.1", port: 4069, restricted: true, "access-token": null},
 	    opencl: {enabled: false}, cuda: {enabled: false},
 	    pools: [{url: $url, user: $user, pass: $pass, algo: $algo}

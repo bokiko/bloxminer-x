@@ -24,6 +24,10 @@ BloxMiner-X's `h-stats.sh` reads XMRig's own local HTTP API (`/2/summary`, `/2/b
   seconds of hashing actually stopping, and is not a "completed work" timestamp.
 - If XMRig's API cannot be reached, or the socket on the configured port belongs to a different process (not
   this package's own `xmrig`), stats report 0 rather than showing another miner's numbers.
+- The whole `h-stats.sh` run shares one 3-second deadline; whatever a step (an API call, the sensor helper)
+  cannot finish within what is left of that budget is skipped, and the run falls back rather than risk overrunning.
+- State changes (API unavailable, affinity mapping not verified, recovered) get one line each in the miner log
+  file - never on stdout - so the log shows what happened without being spammed on every poll.
 
 ## HiveOS flight sheet fields
 
@@ -37,9 +41,11 @@ BloxMiner-X's `h-stats.sh` reads XMRig's own local HTTP API (`/2/summary`, `/2/b
 
 ## Extra config keys
 
-Extra config is merged into the top-level XMRig config. A few keys BloxMiner-X always controls itself are
-dropped (with a message in the miner log) if present: `donate-level`, `donate-over-proxy`, `http`, `api`,
-`autosave`, `log-file`, `background`, `syslog`, `opencl`, `cuda`, and `cpu.enabled`.
+Extra config is merged into the top-level XMRig config (as a default that XMRig's config format then overrides
+where BloxMiner-X needs a fixed value - Extra config CAN still override generic defaults like `"print-time"`).
+A few keys BloxMiner-X always controls itself are dropped (with a message in the miner log) if present:
+`donate-level`, `donate-over-proxy`, `http`, `api`, `autosave`, `log-file`, `background`, `syslog`, `opencl`,
+`cuda`, `cpu.enabled` and `cpu."huge-pages"`.
 
 Two keys are handled specially:
 
@@ -50,6 +56,13 @@ Two keys are handled specially:
 
 Anything else passes straight through, e.g. `"cpu": {"max-threads-hint": 50}` or `"cpu": {"rx": [0,1,2,3]}`
 to steer XMRig's own thread autoconfiguration, or `"randomx": {"rdmsr": false}`.
+
+`"1gb-pages": true` is also accepted nested as `"randomx": {"1gb-pages": true}` - both forms go through the
+same NUMA-memory gate, so there is no way to set it unchecked.
+
+**Limitation (1.0.0):** the pool list is always exactly the one flight-sheet pool; Extra config cannot add a
+failover/backup pool via a `"pools"` array (any `"pools"` in Extra config is ignored) - the same limitation as
+the Verus BloxMiner.
 
 ## Requirements
 
@@ -66,12 +79,17 @@ build/package.sh <outdir> [pkgdir]
 `build/build.sh` clones XMRig at the pinned tag, verifies the exact commit, applies `build/donate0.patch`
 (the only source change), builds static libuv/hwloc/OpenSSL from sha256-pinned tarballs, and builds both
 `xmrig` and `bloxsense` as static binaries (no dynamic library dependencies). `build/package.sh` assembles
-the HiveOS package `bloxminer-x-<version>.tar.gz` with a generated `SOURCE.md` and the bundled licenses.
+two artefacts: the HiveOS package `bloxminer-x-<version>.tar.gz` (with a generated `SOURCE.md`, the bundled
+licenses and `build.provenance`), and `bloxminer-x-<version>-src.tar.gz`, the GPL "Corresponding Source" - a
+fresh, re-verified checkout of XMRig at the pinned commit with `donate0.patch` already applied, plus the build
+scripts and bloxsense sources, so anyone can inspect or rebuild the modified binaries without trusting this
+repo's binaries or re-deriving the patch themselves.
 
 ## Tests
 
 ```
-tests/bloxsense/run_tests.sh   # blox_sys.cpp unit tests + a bloxsense --json CLI smoke test (needs g++, jq)
+tests/bloxsense/run_tests.sh   # blox_sys.cpp unit tests + a bloxsense --json CLI smoke test, each run once
+                                # plain and once under ASan+UBSan (needs g++, jq)
 tests/hive/test_hive_scripts.sh   # h-config.sh / h-stats.sh behaviour against fake sysfs/procfs/API fixtures
 ```
 

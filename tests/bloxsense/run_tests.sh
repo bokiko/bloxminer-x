@@ -96,5 +96,28 @@ if [[ $rc == 0 ]] && jq -e '.power_w == null' <<< "$json" > /dev/null 2>&1; then
 # ---- bad invocation
 if "$T/bloxsense" > /dev/null 2>&1; then bad "no args -> non-zero exit" "exit 0"; else ok "no args -> non-zero exit"; fi
 
+# ------------------------------------------------------------------ ASan/UBSan build (plan R7, needed for X3)
+# shellcheck disable=SC2054   # the comma is part of -fsanitize's own argument, not an array separator
+SANFLAGS=(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
+if g++ -std=c++17 -O1 -g -Wall -Wextra "${SANFLAGS[@]}" -I"$SRC" "$HERE/test_sys.cpp" "$SRC/blox_sys.cpp" -o "$T/test_sys_san" 2>"$T/build_san.log"; then
+	out=$(ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 "$T/test_sys_san" 2>&1); rc=$?
+	if [[ $rc == 0 ]]; then ok "blox_sys.cpp unit tests under ASan+UBSan ($(tail -1 <<< "$out"))"; else bad "blox_sys.cpp unit tests under ASan+UBSan" "$out"; fi
+else
+	bad "blox_sys.cpp unit tests under ASan+UBSan (build)" "$(cat "$T/build_san.log")"
+fi
+
+if g++ -std=c++17 -O1 -g -Wall -Wextra "${SANFLAGS[@]}" -I"$SRC" "$SRC/bloxsense.cpp" "$SRC/blox_sys.cpp" -o "$T/bloxsense_san" 2>"$T/build_san2.log"; then
+	rm -rf "$T/root"; put "/proc/cpuinfo" "$(printf 'processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 1\nmodel name\t: Some CPU')"
+	cpu 0 0 0; cpu 1 0 1   # no RAPL configured: no 1 s sample, keeps the sanitizer run fast
+	out=$(ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 BLOX_SYSFS_ROOT="$T/root" "$T/bloxsense_san" --json 2>&1); rc=$?
+	if [[ $rc == 0 ]] && jq -e '.cpus | length == 2' <<< "$out" > /dev/null 2>&1; then
+		ok "bloxsense --json under ASan+UBSan"
+	else
+		bad "bloxsense --json under ASan+UBSan" "$out"
+	fi
+else
+	bad "bloxsense --json under ASan+UBSan (build)" "$(cat "$T/build_san2.log")"
+fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

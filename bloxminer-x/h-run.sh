@@ -15,21 +15,18 @@ if ! cpu_ok; then
 	sleep 60; exit 1
 fi
 
-# Huge pages: reserve them before the miner starts, the same way Hive's own xmrig-new integration does
-# (/hive/miners/xmrig-new/h-run.sh): reset the sysctl count, then let Hive's own `hugepages` tool re-reserve
-# them sized for RandomX (`-erx` when Extra config turned on 1 GB pages, `-rx` otherwise). If that tool is not
-# on this rig (older Hive, or running outside Hive for a test), do nothing here - XMRig reserves its own 2 MB
-# pages as root on startup either way.
+# Huge pages: reserve 2 MB pages before the miner starts, the same way Hive's own xmrig-new integration does
+# (/hive/miners/xmrig-new/h-run.sh) - run Hive's own `hugepages -rx` tool if it exists on this rig. If it is
+# not present (older Hive, or running outside Hive for a test), do nothing here - XMRig reserves its own 2 MB
+# pages as root on startup either way. 1 GB pages are XMRig's own concern: h-config.sh only ever passes
+# "randomx": {"1gb-pages": true} after its own NUMA free-memory check, and XMRig reserves/falls back to 2 MB
+# pages itself at runtime (R5') - h-run.sh takes no separate action for it.
 if command -v hugepages > /dev/null 2>&1; then
-	sysctl -w vm.nr_hugepages=0 > /dev/null 2>&1
-	if jq -e '.randomx."1gb-pages" == true' "$CUSTOM_CONFIG_FILENAME" > /dev/null 2>&1; then
-		hugepages -erx
-	else
-		hugepages -rx
-	fi
+	hugepages -rx
 fi
 
-# XMRig runs directly on the HiveOS screen terminal; its own console output is plain lines + SGR colour, and
-# it writes its own log file (config "log-file" = $CUSTOM_LOG_BASENAME.log, XMRig rotates it itself).
+# XMRig runs directly on the HiveOS screen terminal; its own console output is plain lines + SGR colour. Its
+# log file (config "log-file" = $CUSTOM_LOG_BASENAME.log) is append-only - XMRig itself never rotates it; the
+# size bound comes from Hive's own start-time gzip rotation plus its 15-minute `logtruncateall` cron (20 MB).
 # exec: Hive supervises the miner process itself and gets its exit status.
 exec ./xmrig -c "$CUSTOM_CONFIG_FILENAME"
