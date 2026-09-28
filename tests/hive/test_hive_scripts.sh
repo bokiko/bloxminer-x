@@ -485,6 +485,57 @@ else
 fi
 pkill -9 -f "$MARKER2" 2>/dev/null
 
+# ---- process-group isolation: the parent must never read/trust the child's pgid before the child itself has
+#      confirmed (via a handshake, written only AFTER its own setsid takes effect) that it is truly isolated -
+#      otherwise a premature read could see the CALLER's own (inherited) pgid, and a later group-kill could
+#      hit the caller itself. Simulated via a test-only env hook that delays the child's handshake write; a
+#      "caller" runs in its own session with a marker sibling process that must never be touched no matter what,
+#      while a hanging bloxsense still gets cleaned up once the (delayed but eventually valid) handshake arrives.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+CALLER_MARKER="bloxminerx_test_caller_$$"
+MARKER3="bloxminerx_test_survivor_bloxsense2_$$"
+reset_proc; listen 20026 1026 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+cat > "$BLOX_DIR/bloxsense" <<EOF
+#!/bin/bash
+trap '' TERM
+exec -a $MARKER3 sleep 30
+EOF
+chmod +x "$BLOX_DIR/bloxsense"
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20026 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+
+cat > "$T/wrapper.sh" <<WRAP
+#!/bin/bash
+exec -a $CALLER_MARKER sleep 60 > /dev/null 2>&1 &
+export BLOX_DIR="$BLOX_DIR"
+export BLOX_API_PORT=20026
+export BLOX_HSTATS_TEST_HANDSHAKE_DELAY=0.2
+t0=\$(date +%s.%N)
+. "$BLOX_DIR/h-stats.sh"
+t1=\$(date +%s.%N)
+jq -nc --arg k "\$khs" --arg s "\$stats" --arg e "\$(awk -v a="\$t0" -v b="\$t1" 'BEGIN{print b-a}')" \
+	'{khs: \$k, stats: (\$s | fromjson), elapsed: (\$e | tonumber)}'
+WRAP
+chmod +x "$T/wrapper.sh"
+res=$(setsid bash "$T/wrapper.sh" 2>&1)
+sleep 0.5
+caller_alive=$(pgrep -f "$CALLER_MARKER" || true)
+bloxsense_survivors=$(pgrep -f "$MARKER3" || true)
+elapsed=$(jq -r '.elapsed' <<< "$res" 2>/dev/null); [[ -n $elapsed && $elapsed != null ]] || elapsed=99
+if [[ -n $caller_alive ]] && [[ -z $bloxsense_survivors ]] && awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' \
+	&& [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]]
+then
+	ok "process-group isolation: caller's group survives, bloxsense reaped, < 3.0 s (${elapsed}s)"
+else
+	bad "process-group isolation: caller's group survives, bloxsense reaped, < 3.0 s" \
+		"caller_alive=[$caller_alive] bloxsense_survivors=[$bloxsense_survivors] elapsed=$elapsed res=$res"
+fi
+pkill -9 -f "$CALLER_MARKER" 2>/dev/null
+pkill -9 -f "$MARKER3" 2>/dev/null
+bloxsense_says "$(fake_topo_json 4)"
+
 # ================================================================== diagnostics: one log line per state change
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 PKG2="$T/pkg2"; mkdir -p "$PKG2" "$T/log2"

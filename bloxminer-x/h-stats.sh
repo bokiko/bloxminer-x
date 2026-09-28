@@ -10,6 +10,13 @@
 # collection nests its own `timeout` call for bloxsense, GNU timeout's own signal only ever reaches its direct
 # child, not that nested timeout's descendants, so a bloxsense (or curl) that ignores SIGTERM could survive as
 # an orphan after this script returns. `setsid` plus our own `kill -- -$pgid` reaches every descendant, tested.
+# That pgid is NEVER read by this script itself via `ps` right after backgrounding the child - immediately
+# after fork, the new process can still be running with our OWN (inherited) pgid for a brief window before it
+# reaches its own setsid() call, and a group-kill against a pgid read during that window could hit our own
+# caller instead of the collection. Instead, the child reports its OWN pgid into a handshake file, written
+# only after its setsid has taken effect; a kill is only ever sent to a group when that handshake has arrived
+# and reads back exactly the child's own pid, and differs from our own pgid and from 0/1 - anything else,
+# including the handshake simply not having arrived yet, signals the child's own pid alone, never a group.
 # The parent (this file) always has a defined answer ready (the fallback below) for when the child is killed,
 # read back from a temp file rather than a pipe, so a would-be survivor holding a pipe open can never hang it.
 # Inside the child, the remaining time is still recomputed before every step, and each step is additionally
@@ -227,11 +234,45 @@ KILL_GRACE=0.3      # extra time after SIGTERM before SIGKILL - bounds the hard 
 # ever held its write end (including an orphan that somehow escaped the kill) has closed it, so a survivor
 # could hang this parent forever. Reading a plain file back never blocks on a stale writer.
 OUTFILE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-x-hstats-out.XXXXXX") || OUTFILE=""
-if [[ -n $OUTFILE ]]; then
-	# shellcheck disable=SC2016   # $1 is the child bash's own positional parameter, not this shell's
-	BUDGET="$CHILD_BUDGET" setsid bash -c '. "$1"; t0=$(date +%s.%N); collect' _ "$LIB" > "$OUTFILE" 2>/dev/null &
+# The child reports its OWN pgid, AFTER its setsid has taken effect, into this handshake file - this script
+# never reads the child's pgid via `ps` itself. Right after backgrounding, the new process may still be
+# running with the FORK-INHERITED pgid (ours, or whatever our own caller's is) for a brief window before it
+# reaches its own setsid() call; reading `ps -o pgid=` at that instant would see that inherited pgid, and a
+# later group-kill against it could hit our own caller instead of the collection. Only a value the child
+# itself reports, once it truly is isolated, is ever trusted for a group-wide signal.
+HANDSHAKE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-x-hstats-hs.XXXXXX") || HANDSHAKE=""
+PARENT_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
+
+if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
+	# shellcheck disable=SC2016   # $1/$2 are the child bash's own positional parameters, not this shell's
+	BUDGET="$CHILD_BUDGET" setsid bash -c '
+		[[ -n ${BLOX_HSTATS_TEST_HANDSHAKE_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_HANDSHAKE_DELAY"   # tests only
+		{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
+		. "$1"; t0=$(date +%s.%N); collect
+	' _ "$LIB" "$HANDSHAKE" > "$OUTFILE" 2>/dev/null &
 	CPID=$!
-	CPGID=$(ps -o pgid= -p "$CPID" 2>/dev/null | tr -d '[:space:]'); [[ -n $CPGID ]] || CPGID=$CPID
+
+	# A group-kill is only ever attempted against a pgid that: came from the handshake (so it is what the
+	# child itself measured, post-setsid, not a guess made from out here), equals $CPID (confirming the child
+	# became its own session/process-group leader), and differs from our own pgid and from 0/1 (confirming
+	# real isolation, not an accidental no-op or a kernel/init group). Anything else - including the
+	# handshake simply not having arrived yet - falls back to signalling $CPID alone, never a group.
+	validated_pgid() {
+		local hs=""
+		[[ -s $HANDSHAKE ]] && hs=$(cat "$HANDSHAKE" 2>/dev/null)
+		[[ $hs =~ ^[0-9]+$ ]] || return 1
+		[[ $hs == "$CPID" && $hs != "$PARENT_PGID" ]] || return 1
+		(( hs > 1 )) || return 1
+		echo "$hs"
+	}
+	still_running() {   # true if the (validated) group, or else just $CPID, still has anything alive
+		local g; g=$(validated_pgid)
+		if [[ -n $g ]]; then pgrep -g "$g" > /dev/null 2>&1; else kill -0 "$CPID" 2>/dev/null; fi
+	}
+	escalate() {   # $1 = signal name
+		local g; g=$(validated_pgid)
+		if [[ -n $g ]]; then kill -"$1" -- "-$g" 2>/dev/null; else kill -"$1" "$CPID" 2>/dev/null; fi
+	}
 
 	# These alarm sleeps must never inherit this script's own stdout/stderr: when h-stats.sh itself is run
 	# inside a command substitution (as Hive's agent, and every test here, does), an orphaned background job
@@ -241,27 +282,26 @@ if [[ -n $OUTFILE ]]; then
 	{ sleep "$CHILD_BUDGET"; } > /dev/null 2>&1 & ALARM=$!
 	wait -n "$CPID" "$ALARM" 2>/dev/null
 	rc=$?
-	# Checked by whether ANYTHING remains in the whole process group, not just whether $CPID itself is still
-	# alive: $CPID is a plain bash process that dies immediately from this TERM, even when a SIGTERM-ignoring
-	# descendant of its (e.g. a stuck bloxsense) does not - checking only $CPID would look like "done" while
-	# such a descendant survives as an orphan. pgrep -g lists live members of a group by its number regardless
-	# of whether the original leader is still one of them.
-	if pgrep -g "$CPGID" > /dev/null 2>&1; then
-		# the budget alarm fired first, not the collection itself: escalate against the whole group (setsid
-		# made $CPID its own session/process-group leader, so -$CPGID reaches every descendant, including a
-		# nested `timeout --foreground` and whatever it is guarding)
-		kill -TERM -- "-$CPGID" 2>/dev/null
+	# Checked by whether ANYTHING remains (in the validated group, or else just $CPID), not just whether
+	# $CPID itself is still alive: $CPID is a plain bash process that dies immediately from a TERM, even when
+	# a SIGTERM-ignoring descendant of its (e.g. a stuck bloxsense) does not - checking only $CPID would look
+	# like "done" while such a descendant survives as an orphan.
+	if still_running; then
+		# the budget alarm fired first, not the collection itself: escalate against the validated group when
+		# one is available (reaching every descendant, including a nested `timeout --foreground` and whatever
+		# it is guarding), else against $CPID alone - never a guessed or unconfirmed group
+		escalate TERM
 		kill "$ALARM" 2>/dev/null; wait "$ALARM" 2>/dev/null
 		sleep "$KILL_GRACE"
-		pgrep -g "$CPGID" > /dev/null 2>&1 && kill -KILL -- "-$CPGID" 2>/dev/null
-		wait "$CPID" 2>/dev/null   # $CPID was still unreaped here (the group was non-empty) - reap it, get its real exit status
+		still_running && escalate KILL
+		wait "$CPID" 2>/dev/null   # $CPID was still unreaped here - reap it, get its real exit status
 		rc=$?
 	else
 		# $CPID (not $ALARM) is what the first wait -n above reaped: $rc already holds its real exit status
 		kill "$ALARM" 2>/dev/null; wait "$ALARM" 2>/dev/null
 	fi
 	result=$(cat "$OUTFILE" 2>/dev/null)
-	rm -f "$OUTFILE"
+	rm -f "$OUTFILE" "$HANDSHAKE"
 else
 	rc=1; result=""
 fi
