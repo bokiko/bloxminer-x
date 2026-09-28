@@ -91,6 +91,11 @@ repo's binaries or re-deriving the patch themselves.
 tests/bloxsense/run_tests.sh   # blox_sys.cpp unit tests + a bloxsense --json CLI smoke test, each run once
                                 # plain and once under ASan+UBSan (needs g++, jq)
 tests/hive/test_hive_scripts.sh   # h-config.sh / h-stats.sh behaviour against fake sysfs/procfs/API fixtures
+tests/hive/test_under_load.sh     # h-stats.sh under real CPU load, with a large fake /proc and with a real
+                                   # xmrig --bench - proves the /proc scans stay fast under load, not just on
+                                   # an idle box (needs nproc; the real-xmrig case needs ~/bxwork/out/xmrig)
+tests/build/test_package_provenance.sh   # build/package.sh refuses to ship a helper source that changed
+                                          # since build/build.sh recorded its sha256
 ```
 
 No performance claims are made here; XMRig's own donation mechanism is documented in `src/donate.h` and

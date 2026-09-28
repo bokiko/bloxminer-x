@@ -3,7 +3,11 @@
 # whole run, enforced by running the ENTIRE collection (the /proc ownership scan, both API calls, the /proc
 # task-mask scan, bloxsense, and the jq row assembly) inside a single child process, not just individual
 # steps: a /proc scan on a rig with an unusually large process table, or any other step, can never make this
-# script overrun its budget, because the whole child is killed outright if it does not finish in time.
+# script overrun its budget, because the whole child is killed outright if it does not finish in time. Both
+# /proc scans (ownership, task-mask) do ONE fork total each, regardless of how many fds/tasks exist: `find
+# -lname` and a single `awk` do their own comparisons in-process instead of forking readlink/sed per item - a
+# per-item loop here previously cost a real rig a hard fallback (~870 fds, all 32 threads mining, budget blown
+# mid-scan under that fork load; an idle dev box never showed it).
 # That child runs via `setsid`, its own dedicated session/process group, with an explicit TERM-then-KILL
 # escalation below targeting that whole group (SIGTERM at 2.4 s, SIGKILL at 2.7 s if that is ignored -
 # unmaskable, so nothing outlives it) - plain `timeout` was tried first and found NOT reliable here: when the
@@ -63,24 +67,6 @@ cap() { awk -v r="$1" -v c="$2" 'BEGIN{print (r<c)?r:c}'; }   # min(remaining, n
 
 int() { [[ $1 =~ ^[0-9]+$ ]]; }
 
-# a Cpus_allowed_list value ("0-3,8" or "5"): prints the single CPU number when it expands to exactly one, else nothing
-single_cpu() {
-	local list=$1 count=0 last='' p a b
-	IFS=',' read -ra parts <<< "$list"
-	for p in "${parts[@]}"; do
-		if [[ $p == *-* ]]; then
-			a=${p%-*}; b=${p#*-}
-			int "$a" && int "$b" || return 0
-			count=$(( count + b - a + 1 )); last=$a
-		else
-			int "$p" || return 0
-			count=$(( count + 1 )); last=$p
-		fi
-		(( count > 1 )) && return 0
-	done
-	(( count == 1 )) && echo "$last"
-}
-
 note_state() {   # $1 = ok | unverified | unavailable; logs only on a transition, never to stdout
 	local prev="" cur=$1 msg=""
 	[[ -f $STATEFILE ]] && prev=$(<"$STATEFILE")
@@ -116,8 +102,8 @@ valid_backends() {
 # Collects everything and sets $khs/$stats. Every early exit is a plain `return 0` (this always runs as a
 # function, whether called directly by the parent's own fallback path or, normally, inside the timed child).
 run() {
-	local r port_hex inode owner_pid owned fd sum back uptime acc rej threads naff sense pkg_temp power_raw
-	local percore singles st list c task_set api_set rows
+	local r port_hex inode owner_pid owned fd_dir sum back uptime acc rej threads naff sense pkg_temp power_raw
+	local percore task_set api_set rows
 
 	r=$(remaining); have_budget "$r" || { note_state unavailable; fallback ""; return 0; }
 
@@ -127,12 +113,16 @@ run() {
 		"$PROC/net/tcp" 2>/dev/null | head -n1)
 	owner_pid=""
 	if [[ -n $inode ]]; then
-		for fd in "$PROC"/[0-9]*/fd/*; do
-			[[ -e $fd || -L $fd ]] || continue
-			[[ $(readlink "$fd" 2>/dev/null) == "socket:[$inode]" ]] || continue
-			owner_pid=${fd#"$PROC"/}; owner_pid=${owner_pid%%/*}
-			break
-		done
+		# ONE fork total, whatever the size of the process table: `find -lname` compares every fd's symlink
+		# target internally (no readlink child process per fd). A per-fd `readlink` loop here previously forked
+		# once per fd - on a busy rig with hundreds of processes and thousands of fds, and every CPU already
+		# saturated by mining, those forks alone were slow enough to blow the whole child's budget outright
+		# (seen for real on a 5950X mining on all 32 threads: ~870 fds, budget expired mid-scan, hard fallback).
+		fd_dir=$(find "$PROC" -mindepth 3 -maxdepth 3 -path "$PROC/[0-9]*/fd/*" -lname "socket:\[$inode\]" \
+			-printf '%h\n' 2>/dev/null | head -n1)
+		if [[ -n $fd_dir ]]; then
+			owner_pid=${fd_dir#"$PROC"/}; owner_pid=${owner_pid%%/*}
+		fi
 	fi
 	owned=0
 	if [[ -n $owner_pid ]] && [[ $(readlink "$PROC/$owner_pid/exe" 2>/dev/null) == "$PKG/xmrig" ]]; then owned=1; fi
@@ -178,17 +168,37 @@ run() {
 	if have_budget "$r" && jq -e --argjson s "$sense" 'all(.affinity >= 0) and (map(.affinity as $a | ($s.cpus | any(.cpu == $a))) | all)' \
 		<<< "$threads" > /dev/null 2>&1
 	then
-		singles=()
+		# ONE awk fork over every task's status file, whatever their count: a task is "single-CPU" when its
+		# Cpus_allowed_list expands to exactly one CPU. (Previously a per-task loop forked sed+tr+a subshell
+		# for every task - the same class of bug as the fd scan above, fixed the same way: one process reads
+		# every file instead of one process per file.)
+		task_set='[]'
 		if [[ -d $PROC/$owner_pid/task ]]; then
-			for st in "$PROC/$owner_pid"/task/*/status; do
-				[[ -f $st ]] || continue
-				list=$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' "$st" | tr -d '[:space:]')
-				[[ -n $list ]] || continue
-				c=$(single_cpu "$list")
-				[[ -n $c ]] && singles+=("$c")
-			done
+			task_set=$(awk '
+				/^Cpus_allowed_list:/ {
+					val = $0
+					sub(/^Cpus_allowed_list:[ \t]*/, "", val)
+					gsub(/[ \t\r]/, "", val)
+					if (val == "") next
+					n = split(val, parts, ",")
+					count = 0; last = ""; bad = 0
+					for (i = 1; i <= n && !bad; i++) {
+						if (parts[i] ~ /^[0-9]+-[0-9]+$/) {
+							split(parts[i], rg, "-")
+							count += (rg[2] + 0) - (rg[1] + 0) + 1
+							last = rg[1] + 0
+						} else if (parts[i] ~ /^[0-9]+$/) {
+							count += 1
+							last = parts[i] + 0
+						} else {
+							bad = 1
+						}
+						if (count > 1) break
+					}
+					if (!bad && count == 1) print last
+				}
+			' "$PROC/$owner_pid"/task/*/status 2>/dev/null | jq -R 'select(length > 0) | tonumber' | jq -s 'sort')
 		fi
-		task_set=$(printf '%s\n' "${singles[@]}" | jq -R 'select(length > 0) | tonumber' | jq -s 'sort')
 		api_set=$(jq -c '[.[].affinity] | sort' <<< "$threads")
 		jq -e -n --argjson t "$task_set" --argjson a "$api_set" '$t == $a' > /dev/null 2>&1 && percore=1
 	fi
