@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Sourced by the Hive agent: must set $khs (total kH/s) and $stats (JSON). ONE shared 3.0 s deadline for the
 # whole run, enforced by running the ENTIRE collection (the /proc ownership scan, both API calls, the /proc
-# task-mask scan, bloxsense, and the jq row assembly) inside a single child process under `timeout`, not just
-# individual steps: a /proc scan on a rig with an unusually large process table, or any other step, can never
-# make this script overrun its budget, because the whole child is killed outright if it does not finish. The
-# parent (this file) always has a defined answer ready (the fallback below) for when that happens.
+# task-mask scan, bloxsense, and the jq row assembly) inside a single child process, not just individual
+# steps: a /proc scan on a rig with an unusually large process table, or any other step, can never make this
+# script overrun its budget, because the whole child is killed outright if it does not finish in time.
+# That child runs via `setsid`, its own dedicated session/process group, with an explicit TERM-then-KILL
+# escalation below targeting that whole group (SIGTERM at 2.4 s, SIGKILL at 2.7 s if that is ignored -
+# unmaskable, so nothing outlives it) - plain `timeout` was tried first and found NOT reliable here: when the
+# collection nests its own `timeout` call for bloxsense, GNU timeout's own signal only ever reaches its direct
+# child, not that nested timeout's descendants, so a bloxsense (or curl) that ignores SIGTERM could survive as
+# an orphan after this script returns. `setsid` plus our own `kill -- -$pgid` reaches every descendant, tested.
+# The parent (this file) always has a defined answer ready (the fallback below) for when the child is killed,
+# read back from a temp file rather than a pipe, so a would-be survivor holding a pipe open can never hang it.
 # Inside the child, the remaining time is still recomputed before every step, and each step is additionally
 # capped at its own nominal ceiling (curl 0.5 s, bloxsense 1.8 s) so a slow but not-yet-killed step cannot
 # starve the ones after it more than necessary.
@@ -147,7 +154,10 @@ run() {
 	# ---- sensors: whatever is left, capped at min(remaining, 1.8 s)
 	r=$(remaining)
 	if have_budget "$r"; then
-		sense=$(timeout "$(cap "$r" 1.8)" "$PKG/bloxsense" --json 2>/dev/null)
+		# --foreground: keep bloxsense in the SAME process group as this script (and the outer timeout wrapping
+		# the whole run below) instead of a new one of its own - otherwise a bloxsense that ignores SIGTERM
+		# could end up in a process group the outer timeout's kill never reaches, and survive as an orphan.
+		sense=$(timeout --foreground "$(cap "$r" 1.8)" "$PKG/bloxsense" --json 2>/dev/null)
 	else
 		sense=""
 	fi
@@ -209,10 +219,52 @@ LIBEOF
 # shellcheck disable=SC1090   # $LIB is a script this file just generated into a temp file, not a fixed path
 . "$LIB"   # the parent also gets fallback()/note_state() from here, for when the timed child below is killed
 
-CHILD_BUDGET=2.6   # of the shared 3.0 s deadline; the rest is headroom for this wrapper + jq parsing
-# shellcheck disable=SC2016   # $1 is the inner bash -c's own positional parameter, not this shell's
-result=$(BUDGET="$CHILD_BUDGET" timeout -k 1 "$CHILD_BUDGET" bash -c '. "$1"; t0=$(date +%s.%N); collect' _ "$LIB" 2>/dev/null)
-rc=$?
+CHILD_BUDGET=2.4   # of the shared 3.0 s deadline
+KILL_GRACE=0.3      # extra time after SIGTERM before SIGKILL - bounds the hard kill at 2.7 s, leaving 0.3 s of
+                    # slack for this wrapper + jq parsing, so the whole run stays under 3.0 s even in the worst
+                    # case (SIGTERM ignored, waits out the full grace period, then an unmaskable SIGKILL).
+# Captured via a temp file, never a pipe: a command-substitution pipe only reaches EOF once every process that
+# ever held its write end (including an orphan that somehow escaped the kill) has closed it, so a survivor
+# could hang this parent forever. Reading a plain file back never blocks on a stale writer.
+OUTFILE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-x-hstats-out.XXXXXX") || OUTFILE=""
+if [[ -n $OUTFILE ]]; then
+	# shellcheck disable=SC2016   # $1 is the child bash's own positional parameter, not this shell's
+	BUDGET="$CHILD_BUDGET" setsid bash -c '. "$1"; t0=$(date +%s.%N); collect' _ "$LIB" > "$OUTFILE" 2>/dev/null &
+	CPID=$!
+	CPGID=$(ps -o pgid= -p "$CPID" 2>/dev/null | tr -d '[:space:]'); [[ -n $CPGID ]] || CPGID=$CPID
+
+	# These alarm sleeps must never inherit this script's own stdout/stderr: when h-stats.sh itself is run
+	# inside a command substitution (as Hive's agent, and every test here, does), an orphaned background job
+	# that still holds that pipe's write end open blocks the CALLER waiting on it, even after everything else
+	# has finished - regardless of how carefully it is killed/reaped below. Redirecting away from the start
+	# closes that hole outright, and was needed in practice (an un-redirected alarm reproduced exactly this).
+	{ sleep "$CHILD_BUDGET"; } > /dev/null 2>&1 & ALARM=$!
+	wait -n "$CPID" "$ALARM" 2>/dev/null
+	rc=$?
+	# Checked by whether ANYTHING remains in the whole process group, not just whether $CPID itself is still
+	# alive: $CPID is a plain bash process that dies immediately from this TERM, even when a SIGTERM-ignoring
+	# descendant of its (e.g. a stuck bloxsense) does not - checking only $CPID would look like "done" while
+	# such a descendant survives as an orphan. pgrep -g lists live members of a group by its number regardless
+	# of whether the original leader is still one of them.
+	if pgrep -g "$CPGID" > /dev/null 2>&1; then
+		# the budget alarm fired first, not the collection itself: escalate against the whole group (setsid
+		# made $CPID its own session/process-group leader, so -$CPGID reaches every descendant, including a
+		# nested `timeout --foreground` and whatever it is guarding)
+		kill -TERM -- "-$CPGID" 2>/dev/null
+		kill "$ALARM" 2>/dev/null; wait "$ALARM" 2>/dev/null
+		sleep "$KILL_GRACE"
+		pgrep -g "$CPGID" > /dev/null 2>&1 && kill -KILL -- "-$CPGID" 2>/dev/null
+		wait "$CPID" 2>/dev/null   # $CPID was still unreaped here (the group was non-empty) - reap it, get its real exit status
+		rc=$?
+	else
+		# $CPID (not $ALARM) is what the first wait -n above reaped: $rc already holds its real exit status
+		kill "$ALARM" 2>/dev/null; wait "$ALARM" 2>/dev/null
+	fi
+	result=$(cat "$OUTFILE" 2>/dev/null)
+	rm -f "$OUTFILE"
+else
+	rc=1; result=""
+fi
 rm -f "$LIB"
 
 if [[ $rc == 0 ]] && jq -e 'type == "object" and (.khs | type) == "string" and has("stats")' > /dev/null 2>&1 <<< "$result"; then

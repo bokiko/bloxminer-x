@@ -431,6 +431,60 @@ else
 fi
 bloxsense_says "$(fake_topo_json 4)"   # restore a fast bloxsense for anything after this point
 
+# ---- a bloxsense that TRAPS/IGNORES SIGTERM and sleeps indefinitely must still die (via the outer timeout's
+#      SIGKILL grace period reaching the SAME process group, per --foreground), never survive this script, and
+#      never block the parent on a pipe it still holds open (checked via a temp file, not a pipe, already)
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc; listen 20019 1019 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+MARKER1="bloxminerx_test_survivor_bloxsense_$$"
+cat > "$BLOX_DIR/bloxsense" <<EOF
+#!/bin/bash
+trap '' TERM
+exec -a $MARKER1 sleep 30
+EOF
+chmod +x "$BLOX_DIR/bloxsense"
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20019 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+export BLOX_API_PORT=20019
+run_hstats_timed
+sleep 0.5   # let init reap anything that died, before checking for survivors
+survivors1=$(pgrep -f "$MARKER1" || true)
+if awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' && [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]] && [[ -z $survivors1 ]]; then
+	ok "SIGTERM-ignoring bloxsense: killed, no survivors, < 3.0 s (${elapsed}s)"
+else
+	bad "SIGTERM-ignoring bloxsense: killed, no survivors, < 3.0 s" "elapsed=${elapsed}s survivors=[$survivors1] $res"
+fi
+pkill -9 -f "$MARKER1" 2>/dev/null   # safety net: never leak a process into the box even if this test fails
+bloxsense_says "$(fake_topo_json 4)"
+
+# ---- a `curl` that TRAPS/IGNORES SIGTERM and sleeps indefinitely (simulating a stuck/adversarial API call,
+#      invoked directly with no nested timeout of its own) must also be reachable by the same outer kill
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc; listen 20020 1020 "$BLOX_DIR/xmrig"
+FAKEBIN="$T/fakebin"; mkdir -p "$FAKEBIN"
+MARKER2="bloxminerx_test_survivor_curl_$$"
+cat > "$FAKEBIN/curl" <<EOF
+#!/bin/bash
+trap '' TERM
+exec -a $MARKER2 sleep 30
+EOF
+chmod +x "$FAKEBIN/curl"
+OLDPATH=$PATH
+export PATH="$FAKEBIN:$PATH"
+export BLOX_API_PORT=20020
+run_hstats_timed
+export PATH=$OLDPATH
+sleep 0.5
+survivors2=$(pgrep -f "$MARKER2" || true)
+if awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' && [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]] && [[ -z $survivors2 ]]; then
+	ok "SIGTERM-ignoring curl: killed, no survivors, < 3.0 s (${elapsed}s)"
+else
+	bad "SIGTERM-ignoring curl: killed, no survivors, < 3.0 s" "elapsed=${elapsed}s survivors=[$survivors2] $res"
+fi
+pkill -9 -f "$MARKER2" 2>/dev/null
+
 # ================================================================== diagnostics: one log line per state change
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 PKG2="$T/pkg2"; mkdir -p "$PKG2" "$T/log2"
