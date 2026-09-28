@@ -37,8 +37,14 @@
 # i.e. the binding is independently confirmed, not just asserted by the API. Otherwise one row per thread with
 # the package temperature (the core mapping is "unbound"). A row's rate is XMRig's own 10 s average; it drops
 # to 0 within ~10-20 s of hashing stopping - this is not a "completed work" stamp. khs is always the sum of rows.
-# State changes (API unavailable / affinity not verified / recovered) get one line in the miner log, never on
-# stdout (this file is sourced by Hive's agent, not run as a standalone script).
+# State changes (API unavailable / affinity not verified / recovered) get one timestamped line in this
+# package's OWN log, $CUSTOM_LOG_BASENAME.stats.log - never in XMRig's own log file, and never on stdout (this
+# file is sourced by Hive's agent, not run as a standalone script). XMRig's FileLogWriter opens its log with
+# O_CREAT|O_WRONLY (no O_APPEND) and tracks its own write offset from the size at open time: anything else
+# appended to that same file is silently overwritten by XMRig's own next write, so a second writer's lines
+# never survive there - confirmed on a live rig (state transitions really happened, per the state file, but no
+# diagnostic line was ever found in XMRig's log or its rotated copies). The stats log is bounded to its last
+# ~200 lines once it passes 1 MiB.
 # shellcheck disable=SC2034   # khs and stats are read by the Hive agent that sources this file
 . "${BLOX_DIR:-/hive/miners/custom/bloxminer-x}/h-manifest.conf"   # BLOX_DIR: tests only
 
@@ -67,8 +73,11 @@ cap() { awk -v r="$1" -v c="$2" 'BEGIN{print (r<c)?r:c}'; }   # min(remaining, n
 
 int() { [[ $1 =~ ^[0-9]+$ ]]; }
 
-note_state() {   # $1 = ok | unverified | unavailable; logs only on a transition, never to stdout
-	local prev="" cur=$1 msg=""
+note_state() {   # $1 = ok | unverified | unavailable; logs only on a transition, never to stdout, and never
+                 # into XMRig's own log file (see the top comment: XMRig writes it at its own tracked offset
+                 # with no O_APPEND, so anything else appended there is silently overwritten by XMRig's next
+                 # write). Own file instead: $CUSTOM_LOG_BASENAME.stats.log, timestamped, bounded to ~200 lines.
+	local prev="" cur=$1 msg="" statslog="$CUSTOM_LOG_BASENAME.stats.log" sz
 	[[ -f $STATEFILE ]] && prev=$(<"$STATEFILE")
 	[[ $prev == "$cur" ]] && return 0
 	case $cur in
@@ -76,7 +85,15 @@ note_state() {   # $1 = ok | unverified | unavailable; logs only on a transition
 		unverified)  msg="bloxminer-x: affinity not verified, showing per-thread rows" ;;
 		ok)          [[ -n $prev ]] && msg="bloxminer-x: recovered" ;;
 	esac
-	[[ -n $msg ]] && { printf '%s\n' "$msg" >> "$CUSTOM_LOG_BASENAME.log"; } 2>/dev/null
+	if [[ -n $msg ]]; then
+		{
+			sz=$(wc -c < "$statslog" 2>/dev/null | tr -d '[:space:]'); [[ $sz =~ ^[0-9]+$ ]] || sz=0
+			if (( sz > 1048576 )); then
+				tail -n 200 "$statslog" > "$statslog.tmp" 2>/dev/null && mv -f "$statslog.tmp" "$statslog"
+			fi
+			printf '%s %s\n' "$(date '+%F %T')" "$msg" >> "$statslog"
+		} 2>/dev/null
+	fi
 	{ printf '%s' "$cur" > "$STATEFILE"; } 2>/dev/null
 }
 

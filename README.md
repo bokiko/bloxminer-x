@@ -26,8 +26,15 @@ BloxMiner-X's `h-stats.sh` reads XMRig's own local HTTP API (`/2/summary`, `/2/b
   this package's own `xmrig`), stats report 0 rather than showing another miner's numbers.
 - The whole `h-stats.sh` run shares one 3-second deadline; whatever a step (an API call, the sensor helper)
   cannot finish within what is left of that budget is skipped, and the run falls back rather than risk overrunning.
-- State changes (API unavailable, affinity mapping not verified, recovered) get one line each in the miner log
-  file - never on stdout - so the log shows what happened without being spammed on every poll.
+- State changes (API unavailable, affinity mapping not verified, recovered) get one timestamped line each,
+  never on stdout, in a separate file next to the miner log: `<CUSTOM_LOG_BASENAME>.stats.log` (bounded to its
+  last ~200 lines past 1 MiB). They are never written into XMRig's own log file: XMRig's `FileLogWriter` opens
+  that file with `O_CREAT|O_WRONLY` (no `O_APPEND`) and writes at its own tracked offset from the size at open
+  time, so a second writer's appended lines get silently overwritten by XMRig's next write and never survive -
+  confirmed on a live rig. (XMRig's own log can also show a run of NUL bytes where Hive's 20-minute log-size
+  cron truncated the file out from under XMRig's offset; Hive's own "Miner log" view and its truncate command
+  already strip that - it is a pre-existing property of running any miner under Hive's log rotation, not
+  specific to this package.)
 
 ## HiveOS flight sheet fields
 

@@ -545,7 +545,7 @@ ln -sf "$BLOX_DIR/bloxsense" "$PKG2/bloxsense"   # bloxsense_says() below keeps 
 sed -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/config2.json#" \
     -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/log2/bloxminer-x#" "$BLOX_DIR/h-manifest.conf" > "$PKG2/h-manifest.conf"
 jq -n '{pools: [{algo: "rx/0"}]}' > "$T/config2.json"
-STATE2="$T/state2"; LOG2="$T/log2/bloxminer-x.log"
+STATE2="$T/state2"; LOG2="$T/log2/bloxminer-x.stats.log"; MAINLOG2="$T/log2/bloxminer-x.log"
 run_pkg2() { mkdir -p "$STATE2" "$T/log2"; BLOX_DIR=$PKG2 BLOX_STATE_DIR=$STATE2 BLOX_API_PORT=$1 BLOX_PROCFS_ROOT=$PROC \
 	bash -c '. "$BLOX_DIR/h-stats.sh"' > /dev/null 2>&1; }
 loglines() { grep -c "$1" "$LOG2" 2>/dev/null || true; }
@@ -579,6 +579,44 @@ reset_proc; listen 20023 1023 "$PKG2/xmrig"; for c in $(seq 0 3); do task "t$c" 
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 run_pkg2 20023   # recovered again, from unverified this time
 if [[ $(loglines "recovered") == 2 ]]; then ok "state log: recovery from unverified is logged once"; else bad "state log: recovery from unverified is logged once" "$(cat "$LOG2" 2>/dev/null)"; fi
+
+if grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} bloxminer-x: ' "$LOG2" 2>/dev/null; then
+	ok "state log: each line is timestamped"
+else
+	bad "state log: each line is timestamped" "$(cat "$LOG2" 2>/dev/null)"
+fi
+
+# ---- XMRig's own log file is written at XMRig's own tracked offset with no O_APPEND (FileLogWriter), so
+#      anything else appended there is silently overwritten by XMRig's next write - confirmed on a live rig
+#      (state transitions really happened, per the state file, but no diagnostic line ever survived in
+#      XMRig's log). Simulate a concurrent XMRig-like writer that keeps rewriting the main log at a fixed
+#      offset while a transition happens, and confirm the diagnostic still survives - in its own file.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+rm -rf "$STATE2" "$T/log2"; mkdir -p "$T/log2"
+printf 'XMRIG STARTUP BANNER\n' > "$MAINLOG2"
+(
+	i=0
+	while [[ $i -lt 20 ]]; do
+		printf 'XMRIG LOG LINE %03d (fixed-offset rewrite, no append)\n' "$i" > "$MAINLOG2" 2>/dev/null
+		i=$((i + 1))
+		sleep 0.05
+	done
+) &
+XMRIG_WRITER_PID=$!
+reset_proc   # nothing listening: unavailable
+run_pkg2 20030
+kill "$XMRIG_WRITER_PID" 2>/dev/null; wait "$XMRIG_WRITER_PID" 2>/dev/null
+if grep -q "bloxminer-x: stats API unavailable" "$LOG2" 2>/dev/null; then
+	ok "diagnostics survive a concurrent fixed-offset rewriter of the main log"
+else
+	bad "diagnostics survive a concurrent fixed-offset rewriter of the main log" \
+		"statslog=$(cat "$LOG2" 2>/dev/null) mainlog=$(cat "$MAINLOG2" 2>/dev/null)"
+fi
+if ! grep -q "bloxminer-x:" "$MAINLOG2" 2>/dev/null; then
+	ok "the main (XMRig) log never receives a bloxminer-x diagnostic line"
+else
+	bad "the main (XMRig) log never receives a bloxminer-x diagnostic line" "$(cat "$MAINLOG2" 2>/dev/null)"
+fi
 
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 reset_proc   # a transition-worthy run (unavailable), captured without discarding stdout this time
