@@ -349,9 +349,8 @@ else
 	bad "budget: slow bloxsense capped by the remaining shared budget" "elapsed=${elapsed}s $res"
 fi
 
-# a hanging/very slow API (10 s reply delay) AND a slow bloxsense together: the first curl consumes nearly the
-# whole shared budget, so backends/bloxsense are skipped outright rather than each getting their own fresh
-# allowance - the combined worst case still stays under 3.2 s and falls back cleanly (khs 0, hs [0])
+# a hanging/very slow API (10 s reply delay): each curl is still capped at its own 0.5 s ceiling (not the
+# whole remaining budget), so this falls back quickly and cleanly (khs 0, hs [0]), well under 3.2 s
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" --argjson d 10 '{summary: $s, backends: $b, delay: $d}' > "$T/replies.json"
 : > "$T/api.out"
@@ -361,9 +360,74 @@ reset_proc; listen 20016 1016 "$BLOX_DIR/xmrig"
 export BLOX_API_PORT=20016
 run_hstats_timed
 if under_budget "$elapsed" && [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]]; then
-	ok "budget: hanging API + slow bloxsense together still fall back under 3.2 s (${elapsed}s)"
+	ok "budget: hanging API falls back under 3.2 s (${elapsed}s)"
 else
-	bad "budget: hanging API + slow bloxsense together still fall back under 3.2 s" "elapsed=${elapsed}s $res"
+	bad "budget: hanging API falls back under 3.2 s" "elapsed=${elapsed}s $res"
+fi
+
+# a LARGE /proc (thousands of fd entries, none matching, plus thousands of stale task entries) together with a
+# hanging API: the /proc ownership scan and the task-mask scan are not individually timed steps - they only
+# stay bounded because the ENTIRE collection runs inside one child process under `timeout`. This proves a
+# pathologically large process table can never make h-stats.sh itself overrun the shared deadline.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc
+python3 - "$PROC" <<'PY'
+import os, sys
+root = sys.argv[1]
+fddir = os.path.join(root, "1017", "fd")
+os.makedirs(fddir, exist_ok=True)
+for i in range(6000):   # none of these match the inode below: forces a full, futile scan of all 6000 entries
+	os.symlink("socket:[%d]" % (900000 + i), os.path.join(fddir, str(i)))
+taskdir = os.path.join(root, "1017", "task")
+for i in range(6000):
+	d = os.path.join(taskdir, str(i))
+	os.makedirs(d, exist_ok=True)
+	with open(os.path.join(d, "status"), "w") as f:
+		f.write("Cpus_allowed_list:\t%d\n" % (i % 4))
+PY
+hex1017=$(printf '%04X' 20017)
+{
+	echo "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+	printf '   0: 0100007F:%s 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1099 1 0000000000000000 100 0 0 10 0\n' "$hex1017"
+} > "$PROC/net/tcp"
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" --argjson d 10 '{summary: $s, backends: $b, delay: $d}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20017 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+export BLOX_API_PORT=20017
+run_hstats_timed
+if under_budget "$elapsed" && [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "budget: huge /proc (6000 fd + 6000 tasks) + hanging API still bounded, falls back (${elapsed}s)"
+else
+	bad "budget: huge /proc (6000 fd + 6000 tasks) + hanging API still bounded, falls back" "elapsed=${elapsed}s $res"
+fi
+
+# a LARGE task list (6000 stale entries) with otherwise-healthy ownership and API: exercises the task-mask
+# scan specifically (rather than the ownership fd-scan above) - still bounded, and always produces a
+# well-formed result (either genuine per-thread rows, if the scan finishes in time, or the defined fallback).
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc; listen 20018 1018 "$BLOX_DIR/xmrig"
+python3 - "$PROC" <<'PY'
+import os, sys
+root = sys.argv[1]
+taskdir = os.path.join(root, "1018", "task")
+for i in range(6000):   # none of these are single-CPU masks matching our 4 real thread affinities
+	d = os.path.join(taskdir, str(i))
+	os.makedirs(d, exist_ok=True)
+	with open(os.path.join(d, "status"), "w") as f:
+		f.write("Cpus_allowed_list:\t0-31\n")
+PY
+bloxsense_says "$(fake_topo_json 4)"
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20018 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+export BLOX_API_PORT=20018
+run_hstats_timed
+if under_budget "$elapsed" && [[ $(jq -r '(.stats.hs | type) == "array"' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "budget: huge task list (6000 entries) stays bounded, well-formed result (${elapsed}s)"
+else
+	bad "budget: huge task list (6000 entries) stays bounded, well-formed result" "elapsed=${elapsed}s $res"
 fi
 bloxsense_says "$(fake_topo_json 4)"   # restore a fast bloxsense for anything after this point
 

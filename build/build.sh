@@ -2,7 +2,8 @@
 # Reproducible-inputs build of BloxMiner-X: XMRig 6.26.0 (0% donate patch) + bloxsense, both static, for the
 # HiveOS package. Host: stock Ubuntu 22.04 x86_64 (container/chroot), run as root.
 # Usage: build/build.sh [outdir]
-# Writes <outdir>/xmrig, <outdir>/bloxsense, <outdir>/build.provenance.
+# Writes <outdir>/xmrig, <outdir>/bloxsense, <outdir>/build.provenance (including the sha256 of every helper
+# source file at build time - see HELPERS below - which build/package.sh later re-verifies before packaging).
 set -euo pipefail
 
 OUT=${1:-$PWD/out}; mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)   # absolute before any cd
@@ -13,6 +14,14 @@ PATCH="$HERE/donate0.patch"
 UPSTREAM=https://github.com/xmrig/xmrig
 TAG=v6.26.0
 COMMIT=b2ca72480c58d197e18c885d9fc1a0c8d517e60a   # pinned tag commit; build fails if the clone disagrees
+
+# "helper" source files (everything BloxMiner-X adds on top of XMRig): their sha256, AS THEY EXIST RIGHT NOW
+# at build time, is recorded in build.provenance below. build/package.sh recomputes these same hashes from the
+# files it is about to ship and refuses to package if any of them changed since this build - so a package can
+# never ship helper sources that do not match the binary they are shipped next to.
+HELPERS=(bloxsense/blox.h bloxsense/blox_sys.cpp bloxsense/bloxsense.cpp
+         bloxminer-x/h-config.sh bloxminer-x/h-run.sh bloxminer-x/h-stats.sh bloxminer-x/h-manifest.conf
+         build/build.sh build/package.sh build/donate0.patch)
 
 # Dependency tarballs xmrig's own scripts/build.uv.sh, build.hwloc.sh, build.openssl3.sh fetch for this tag,
 # pinned by sha256 computed by hand from these exact URLs (upstream ships no checksums for them).
@@ -120,6 +129,9 @@ CMAKEV=$(cmake --version | head -1)
 	echo "os=$(. /etc/os-release && echo "$PRETTY_NAME")"
 	echo "xmrig_sha256=$(sha256sum "$OUT/xmrig" | cut -d' ' -f1)"
 	echo "bloxsense_sha256=$(sha256sum "$OUT/bloxsense" | cut -d' ' -f1)"
+	for h in "${HELPERS[@]}"; do
+		echo "helper.$h.sha256=$(sha256sum "$ROOT/$h" | cut -d' ' -f1)"
+	done
 } > "$OUT/build.provenance"
 
 echo "built $OUT/xmrig and $OUT/bloxsense"
