@@ -10,12 +10,15 @@
  *    "pkg_temp":T|null, "power_w":W|null, "ccd_reason":"..."}
  *
  * Power is a bounded two-read RAPL sample: blox_rapl_watts() is called once to record a baseline energy
- * counter, the process sleeps ~1.0 s (CLOCK_MONOTONIC via blox_rapl_watts' own "now" argument), then
+ * counter, the process sleeps ~0.55 s (CLOCK_MONOTONIC via blox_rapl_watts' own "now" argument), then
  * blox_rapl_watts() is called again; it does the Delta-energy/Delta-time math itself, including counter-wrap
  * handling (via max_energy_range_uj) and the plausibility checks (0 < W <= BLOX_RAPL_MAX_W, sample interval
- * below the range-derived maximum). Any package that is missing or unreadable in either read makes the whole
- * figure unavailable (never a partial or a stale total): power_w is null in that case, exactly as blox_rapl_watts()
- * already returns -1 when it is not confident in the number.
+ * below the range-derived maximum, AND above blox_rapl_watts()'s own hard floor of dt <= 0.5 s being rejected
+ * outright - the 0.55 s sleep is deliberately a little over that floor, not exactly on it, since nanosleep
+ * only guarantees "at least" the requested duration and this must clear that check with real margin, not by
+ * luck). Any package that is missing or unreadable in either read makes the whole figure unavailable (never a
+ * partial or a stale total): power_w is null in that case, exactly as blox_rapl_watts() already returns -1
+ * when it is not confident in the number. blox_rapl_watts()/blox_sys.cpp are unchanged by this file.
  *
  * $BLOX_SYSFS_ROOT (a fake sysfs/procfs tree root, for tests) is honoured because blox_sysfs() in blox_sys.cpp
  * already reads it for every path this tool touches.
@@ -34,10 +37,11 @@ static double mono_now(void)
 	return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-/* Sleep as close to 1.0 s as this process gets, restarting across signal interruptions. */
-static void sleep_one_second(void)
+/* Sleep ~0.55 s (550 ms), restarting across signal interruptions: comfortably above the 0.5 s floor
+ * blox_rapl_watts() itself enforces (a sample with dt <= 0.5 s is rejected there), not sitting right on it. */
+static void sleep_half_second(void)
 {
-	struct timespec req = { 1, 0 }, rem;
+	struct timespec req = { 0, 550000000L }, rem;
 	while (nanosleep(&req, &rem) != 0) req = rem;
 }
 
@@ -93,7 +97,7 @@ int main(int argc, char **argv)
 	double power_w = -1;
 	if (rapl.usable) {
 		blox_rapl_watts(&rapl, mono_now());   /* primes the counters; a rate needs a second read */
-		sleep_one_second();
+		sleep_half_second();
 		power_w = blox_rapl_watts(&rapl, mono_now());
 	}
 

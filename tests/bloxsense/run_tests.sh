@@ -4,7 +4,7 @@
 #     trees), adapted from bloxminer's tests/engine/test_sys.cpp - same fixtures: AMD Vermeer 1/2-CCD, Zen 2
 #     (unvalidated), Tctl-only, multi-socket AMD, Intel coretemp + psys, RAPL wrap/gap/unreadable, no sensors.
 #  2. CLI-level: the actual bloxsense --json binary against a few of the same fake trees, checking the JSON
-#     contract end to end (including a real ~1.0 s two-read power sample).
+#     contract end to end (including a real ~0.55 s two-read power sample).
 # Usage: tests/bloxsense/run_tests.sh
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -51,13 +51,13 @@ put "/sys/class/hwmon/hwmon0/temp3_label" Tccd2; put "/sys/class/hwmon/hwmon0/te
 put "/sys/class/powercap/intel-rapl:0/name" package-0
 put "/sys/class/powercap/intel-rapl:0/energy_uj" 1000000
 put "/sys/class/powercap/intel-rapl:0/max_energy_range_uj" 262143328850
-( sleep 0.5; put "/sys/class/powercap/intel-rapl:0/energy_uj" 51000000 ) &   # +50 J across bloxsense's own ~1.0 s sample
+( sleep 0.25; put "/sys/class/powercap/intel-rapl:0/energy_uj" 51000000 ) &   # +50 J across bloxsense's own ~0.55 s sample (~91 W)
 json=$(run_bloxsense); rc=$?
 wait
 if [[ $rc == 0 ]] && jq -e '.cpus | length == 32' <<< "$json" > /dev/null 2>&1; then ok "5950X: 32 cpu rows"; else bad "5950X: 32 cpu rows" "$json"; fi
 if jq -e '.cpus[3].src == "ccd" and .cpus[3].temp == 61' <<< "$json" > /dev/null 2>&1; then ok "5950X: cpu3 -> Tccd1"; else bad "5950X: cpu3 -> Tccd1" "$json"; fi
 if jq -e '.pkg_temp == 70' <<< "$json" > /dev/null 2>&1; then ok "5950X: pkg_temp = Tctl"; else bad "5950X: pkg_temp = Tctl" "$json"; fi
-if jq -e '.power_w >= 30 and .power_w <= 70' <<< "$json" > /dev/null 2>&1; then ok "5950X: power_w plausible (~50 W)"; else bad "5950X: power_w plausible (~50 W)" "$json"; fi
+if jq -e '.power_w >= 50 and .power_w <= 140' <<< "$json" > /dev/null 2>&1; then ok "5950X: power_w plausible (~91 W over ~0.55 s)"; else bad "5950X: power_w plausible (~91 W over ~0.55 s)" "$json"; fi
 if jq -e '.ccd_reason | test("validated profile")' <<< "$json" > /dev/null 2>&1; then ok "5950X: ccd_reason names the profile"; else bad "5950X: ccd_reason names the profile" "$json"; fi
 
 # ---- Intel i9-10900K: coretemp per core, no RAPL package domain -> power_w null

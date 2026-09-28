@@ -24,7 +24,7 @@
 # The parent (this file) always has a defined answer ready (the fallback below) for when the child is killed,
 # read back from a temp file rather than a pipe, so a would-be survivor holding a pipe open can never hang it.
 # Inside the child, the remaining time is still recomputed before every step, and each step is additionally
-# capped at its own nominal ceiling (curl 0.5 s, bloxsense 1.8 s) so a slow but not-yet-killed step cannot
+# capped at its own nominal ceiling (curl 0.5 s, bloxsense 1.0 s) so a slow but not-yet-killed step cannot
 # starve the ones after it more than necessary.
 # Before trusting 127.0.0.1:$API_PORT at all, this checks that the listening socket belongs to OUR xmrig
 # (its pid's /proc/<pid>/exe is this package's ./xmrig) - a foreign miner bound to the same port is never read.
@@ -148,13 +148,13 @@ run() {
 	naff=$(jq 'length' <<< "$threads" 2>/dev/null); int "$naff" || naff=0
 	if (( naff == 0 )); then fallback ""; return 0; fi   # legitimate: no pool job yet, benign, not logged
 
-	# ---- sensors: whatever is left, capped at min(remaining, 1.8 s)
+	# ---- sensors: whatever is left, capped at min(remaining, 1.0 s) - bloxsense's own RAPL sample is ~0.55 s
 	r=$(remaining)
 	if have_budget "$r"; then
 		# --foreground: keep bloxsense in the SAME process group as this script (and the outer timeout wrapping
 		# the whole run below) instead of a new one of its own - otherwise a bloxsense that ignores SIGTERM
 		# could end up in a process group the outer timeout's kill never reaches, and survive as an orphan.
-		sense=$(timeout --foreground "$(cap "$r" 1.8)" "$PKG/bloxsense" --json 2>/dev/null)
+		sense=$(timeout --foreground "$(cap "$r" 1.0)" "$PKG/bloxsense" --json 2>/dev/null)
 	else
 		sense=""
 	fi

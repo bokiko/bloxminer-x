@@ -4,7 +4,10 @@
 # fork loop was fast enough on an idle dev box to hide the problem entirely, but slow enough under real CPU
 # load (fork/exec latency multiplies badly when every core is busy) to blow the whole 3.0 s budget and make
 # Hive's watchdog see 0 H/s and reboot the rig. Every case here saturates CPUs for its own duration only, and
-# unconditionally cleans up (busy loops, any real xmrig) via a trap even on failure.
+# unconditionally cleans up (busy loops, any real xmrig) via a trap even on failure. bloxsense is never an
+# instant fixture here: case 1 uses one that genuinely sleeps ~0.55 s (matching the real bloxsense's own RAPL
+# two-read sample), and case 2 uses the actual compiled bloxsense binary when available - so the measured wall
+# times reflect true end-to-end latency under load, not an artificially fast stand-in.
 # Usage: tests/hive/test_under_load.sh (needs jq, curl, python3, bash, nproc; case 2 additionally needs a
 # built xmrig at ~/bxwork/out/xmrig - e.g. from build/build.sh - and is skipped if that is not present)
 set -u
@@ -50,8 +53,11 @@ import json
 cpus = [{"cpu": c, "pkg": 0, "core": c % 16, "temp": 60, "src": "core"} for c in range(32)]
 print(json.dumps({"cpus": cpus, "pkg_temp": 65, "power_w": None, "ccd_reason": "test fixture"}))
 ')
+# Sleeps ~0.55 s like the real bloxsense's own RAPL two-read sample, instead of answering instantly - so the
+# wall-time measurement below reflects genuine end-to-end latency under load, not an artificially fast fixture.
 cat > "$BLOX_DIR/bloxsense" <<EOF
 #!/bin/sh
+sleep 0.55
 echo '$BLOXSENSE_JSON'
 EOF
 chmod +x "$BLOX_DIR/bloxsense"
@@ -126,7 +132,12 @@ if [[ -x $XMRIG_BIN ]]; then
 	REAL_DIR="$T/pkg2"; mkdir -p "$REAL_DIR" "$T/log2"
 	cp "$PKGSRC"/h-config.sh "$PKGSRC"/h-stats.sh "$REAL_DIR"/
 	cp "$XMRIG_BIN" "$REAL_DIR/xmrig"
-	cp "$BLOX_DIR/bloxsense" "$REAL_DIR/bloxsense"   # reuse the topology fixture - only h-stats' own mechanics are under test
+	BLOXSENSE_BIN="$HOME/bxwork/out/bloxsense"
+	if [[ -x $BLOXSENSE_BIN ]]; then
+		cp "$BLOXSENSE_BIN" "$REAL_DIR/bloxsense"   # the REAL binary: genuinely real topology, temps and RAPL timing on this box
+	else
+		cp "$BLOX_DIR/bloxsense" "$REAL_DIR/bloxsense"   # fallback: the ~0.55 s-sleeping fixture, if bloxsense was not built
+	fi
 	sed -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/config2.json#" \
 	    -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/log2/bloxminer-x#" "$PKGSRC/h-manifest.conf" > "$REAL_DIR/h-manifest.conf"
 	jq -n '{pools: [{algo: "rx/0"}]}' > "$T/config2.json"
