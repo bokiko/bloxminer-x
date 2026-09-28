@@ -1,0 +1,25 @@
+# Build outputs (produced by build/build.sh and build/package.sh, never committed)
+out/
+build/work/
+*.tar.gz
+SHA256SUMS
+bloxminer-x/xmrig
+bloxminer-x/bloxsense
+bloxminer-x/config.json
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Internal development ledger files / editor auto-backups
+CONTINUITY.md
+CONTINUATION.md
+thoughts/
+.claude/
+.backups/

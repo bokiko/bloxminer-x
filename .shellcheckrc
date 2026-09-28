@@ -1,0 +1,4 @@
+# h-manifest.conf is sourced at runtime from the Hive miner directory
+disable=SC1091
+# `return 0 2>/dev/null || exit 0`: h-stats.sh is sourced by the Hive agent, executed only in tests
+disable=SC2317
