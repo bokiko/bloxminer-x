@@ -850,6 +850,40 @@ OUTFILE="$TMPD/out"
 HANDSHAKE="$TMPD/hs"
 export OUTFILE
 
+# WAITFIFO: gives the parent's own bounded wait (wait_secs(), below) an INDEPENDENT, EOF-driven way to unblock
+# the instant the child (and everything it forked) is truly gone, regardless of whether bash's own `read -t`
+# timeout mechanism behaves correctly under SIGCHLD delivery - a bot-review P1: a real CI run (GH, 2-vCPU)
+# captured a poll where `read -r -t 0.05 -u <fd> _` was entered ~50ms before the child's own exit (almost
+# exactly when both the read's OWN timeout and the child's exit were due to land together) and then never
+# returned at all - the external `timeout 5` had to kill the whole process group at 5.14s. Isolated
+# reproduction attempts (bash 5.1.16 and 5.2.21, thousands of iterations, multiple timing windows, with and
+# without CPU contention) could not reliably reproduce the underlying bash behavior in isolation, but the CI
+# evidence is concrete, and the fix below removes the WHOLE risk class regardless of the exact mechanism:
+# `-t` stays as the NORMAL way this read unblocks (the child still alive, nothing to read), but now there is a
+# SECOND, independent path that does not depend on a timer at all.
+# A plain pipe/FIFO's own read() returns EOF the instant every process holding a WRITABLE reference to it has
+# exited - the kernel delivers this unconditionally, with no timer and no signal-interruption window to lose.
+# The CHILD must be the fd's ONLY writer: created and opened READ-WRITE *before* the child is launched (so it
+# inherits this SAME fd via the fork below - opening it only AFTER backgrounding, as this file's own earlier
+# designs did for OUTFILE/HANDSHAKE, would be too late for a child to inherit something that does not exist
+# yet), then the PARENT immediately gives up its OWN write capability right after capturing $CPID (see
+# PARENT_PGID's own block below): closes its RDWR copy and re-opens the SAME path read-only - safe to do
+# without blocking, since the CHILD (forked while the RDWR copy was still open) is already guaranteed to hold
+# its own independent reference by that point, satisfying a read-only open's own "needs a writer" requirement.
+# Every process the child itself later forks (curl, jq, bloxsense, ...) ALSO inherits a copy by the same plain
+# fork() semantics, deliberately left alone rather than closed everywhere those run: that only means EOF is
+# correctly delayed until EVERY descendant - not just the top-level collector - has actually exited, which is
+# the exact same "anything still alive in the group" condition still_running()'s own pgid-based check already
+# requires before this file ever considers a poll truly finished - the two mechanisms agree by construction,
+# never conflict.
+WAITFIFO="$TMPD/waitfifo"
+waitfd=-1
+mkfifo "$WAITFIFO" 2>/dev/null && { exec {waitfd}<>"$WAITFIFO"; } 2>/dev/null || waitfd=-1
+# mkfifo is this file's only remaining non-bash-builtin fork before the child launches - accepted here because
+# this is a correctness fix (a real hang), not an optimization; wait_secs() already degrades safely to a
+# forking `sleep` whenever its own fd argument is < 0 (mkfifo unsupported/failed), the exact same fallback this
+# file already relied on for the old, less safe <(:) mechanism this replaces.
+
 # shellcheck disable=SC2016   # $1/$2 are the child bash's own positional parameters, not this shell's
 BUDGET_US="$BUDGET_US" DEADLINE_US="$DEADLINE_US" setsid bash -c '
 	[[ -n ${BLOX_HSTATS_TEST_HANDSHAKE_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_HANDSHAKE_DELAY"   # tests only
@@ -872,6 +906,15 @@ CPID=$!
 # changed. Needed only by validated_pgid() below, never called before the poll loop's first iteration - ample
 # time for this fork to complete well before anything actually depends on its result.
 PARENT_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
+# Give up write capability on WAITFIFO now that the child (forked above, while our RDWR copy was still open) is
+# guaranteed to hold its own independent reference to it: close our own RDWR copy and re-open the same path
+# read-only. Cannot block waiting for a writer - the child's own inherited copy already satisfies that,
+# regardless of anything the child's own script does or does not do from here on. See WAITFIFO's own header
+# above for the full rationale (why this fd exists, and why it must be created before the child, not after).
+if (( waitfd >= 0 )); then
+	{ exec {waitfd}<&-; } 2>/dev/null
+	{ exec {waitfd}<"$WAITFIFO"; } 2>/dev/null || waitfd=-1
+fi
 
 {
 	# A group-kill is only ever attempted against a pgid that: came from the handshake (so it is what the
@@ -917,15 +960,9 @@ PARENT_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
 	dbg "parent: launched CPID=$CPID, entering bounded poll"
 	# The deadline is checked BEFORE the liveness probe on every iteration, not after - a poll that is already
 	# out of budget never even pays for the (cheap, but not free) probe.
-	# One process-substitution fork here (never per iteration) for wait_secs's own private fd - see its header.
-	# `exec {fd}... 2>/dev/null` with NO command after it is a bare redirection, not a command invocation -
-	# bash applies it to the CURRENT SHELL PERMANENTLY (exactly like a plain `exec 2>/dev/null` would), not
-	# just to this one statement; this is top-level script code, so there is not even a function scope to
-	# (wrongly) hope would limit it. That would silently redirect this whole process's stderr to /dev/null for
-	# the rest of its life the instant this ran once. The `{ ...; } 2>/dev/null` group form keeps the SAME
-	# {fd} allocation (still visible after the group, since `{ }` is not a subshell) while scoping the
-	# redirect to only the command inside it.
-	waitfd=-1; { exec {waitfd}<> <(:); } 2>/dev/null || waitfd=-1
+	# $waitfd was already created and handed off above (WAITFIFO, before the child was ever launched - a plain
+	# process-substitution fd opened only AFTER backgrounding, as an earlier version of this file did here,
+	# cannot be inherited by a child that already exists by the time it is opened) - nothing left to set up here.
 	while :; do
 		remaining_us; have_budget_us "$REPLY" || break
 		still_running || break

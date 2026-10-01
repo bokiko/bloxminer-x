@@ -719,8 +719,52 @@ fi
 kill "$API4C_PID" 2>/dev/null; wait "$API4C_PID" 2>/dev/null
 unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
 
+# ================================================================== case 4d: WAITFIFO regression - the parent's
+# own bounded wait (wait_secs(), via `read -t 0.05 -u $waitfd`) must never hang even when the collector child
+# exits WHILE that read is in progress. A bot-review P1 (real GH CI, 2-vCPU): a poll where the read was entered
+# ~50ms before the child's own exit - almost exactly when the read's own timeout and the exit were due to land
+# together - never returned at all; the external `timeout 5` had to kill the whole run at 5.14s. Many FAST,
+# healthy polls back-to-back (no artificial delay) each complete in well under a second but still take long
+# enough to pass through a handful of the poll loop's own 50ms wait_secs() ticks - across enough iterations,
+# naturally-varying poll-to-poll jitter lands the child's own exit at many different phase offsets relative to
+# those ticks, including right on top of one, without needing to engineer the exact timing by hand. Every poll
+# must stay well inside the hard cap - on 0910fd3 (the old <(:) -based wait, before this fix) this is exactly
+# the condition the bot's CI trace caught; on the WAITFIFO-based wait this replaces it with, nothing should
+# ever come close, since EOF unblocks the read independently of whatever its own -t timeout does.
+API4D_PID=""
+cleanup4d() { [[ -n $API4D_PID ]] && { kill "$API4D_PID" 2>/dev/null; wait "$API4D_PID" 2>/dev/null; }; stop_saturating; }
+trap 'cleanup; cleanup3; cleanup4; cleanup4b; cleanup4c; cleanup4d' EXIT
+DELAY4D=0.13   # deliberately NOT a clean multiple of the poll loop's own 50ms tick - see the case's own header
+jq -n --argjson s "$SUM3" --argjson b "$BACK3" --argjson d "$DELAY4D" '{summary: $s, backends: $b, delay: $d}' > "$T/replies4d.json"
+: > "$T/api4d.out"
+python3 "$HERE/fake_xmrig_api.py" 4072 "$T/replies4d.json" > "$T/api4d.out" 2>&1 & API4D_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api4d.out" && break; sleep 0.1; done
+grep -q ready "$T/api4d.out" || bad "WAITFIFO regression: fake API startup" "$(cat "$T/api4d.out" 2>/dev/null)"
+export BLOX_DIR="$BLOX_DIR3" BLOX_PROCFS_ROOT="$PROC3" BLOX_API_PORT=4072
+N_POLLS4D=100; HARD_CAP4D=4.0
+n_bad4d=0; max4d=0
+for i in $(seq 1 "$N_POLLS4D"); do
+	t0=$(date +%s.%N)
+	# shellcheck disable=SC2016   # $BLOX_DIR/$khs expand in the inner bash -c, not here
+	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+	t1=$(date +%s.%N)
+	elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+	pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+	awk -v k="${pkhs:-0}" 'BEGIN{exit !(k>0)}' || { n_bad4d=$((n_bad4d+1)); echo "  poll $i: ZERO khs ($res)"; }
+	awk -v e="$elapsed" -v c="$HARD_CAP4D" 'BEGIN{exit !(e > c)}' && { n_bad4d=$((n_bad4d+1)); echo "  poll $i: HARD CAP EXCEEDED (${elapsed}s > ${HARD_CAP4D}s)"; }
+	awk -v e="$elapsed" -v m="$max4d" 'BEGIN{exit !(e > m)}' && max4d=$elapsed
+done
+if (( n_bad4d == 0 )); then
+	ok "WAITFIFO regression: $N_POLLS4D fast back-to-back polls, child exit races the poll loop's own wait - no hang, max ${max4d}s"
+else
+	bad "WAITFIFO regression: $N_POLLS4D fast back-to-back polls, child exit races the poll loop's own wait - no hang" \
+		"n_bad=$n_bad4d/$N_POLLS4D max=${max4d}s"
+fi
+kill "$API4D_PID" 2>/dev/null; wait "$API4D_PID" 2>/dev/null
+unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
+
 leaked=()
-for p in "$API_PID" "$API3_PID" "${API3B_PID:-}" "${API4_PID:-}" "${API4B_PID:-}" "${API4C_PID:-}"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done
+for p in "$API_PID" "$API3_PID" "${API3B_PID:-}" "${API4_PID:-}" "${API4B_PID:-}" "${API4C_PID:-}" "${API4D_PID:-}"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done
 if [[ ${#leaked[@]} -eq 0 ]]; then
 	ok "no leaked fake-API child processes at suite end"
 else
