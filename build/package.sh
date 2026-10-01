@@ -29,17 +29,68 @@ UPSTREAM=$(p upstream); TAG=$(p upstream_tag); COMMIT=$(p upstream_commit)
 # informational only (recorded in SOURCE.md), unlike the helper hashes below, which are enforced.
 REPO_COMMIT=${BLOXMINER_X_REPO_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}
 
+# Release 1.0.1: every check above is self-consistency (does the provenance describe the binary/patch/version
+# actually being shipped?), never "is this the revision this release is actually PINNED to?" - an outdir built
+# from some OTHER xmrig revision or dependency set could still pass every one of those checks and ship as
+# $VER. Read the pin straight out of build/build.sh's own UPSTREAM/TAG/COMMIT and dependency literals (never a
+# second, hand-duplicated copy here, which is exactly what let this drift from the HELPERS list below once
+# already) and refuse unless the provenance's own recorded values actually match them.
+PIN_UPSTREAM=$(sed -n 's/^UPSTREAM=//p' "$HERE/build.sh")
+PIN_TAG=$(sed -n 's/^TAG=//p' "$HERE/build.sh")
+PIN_COMMIT=$(sed -n 's/^COMMIT=\([^[:space:]#]*\).*/\1/p' "$HERE/build.sh")
+[[ -n $PIN_UPSTREAM && -n $PIN_TAG && -n $PIN_COMMIT ]] || { echo "build/build.sh: could not parse its own pinned UPSTREAM/TAG/COMMIT - refusing to package"; exit 1; }
+[[ $(p upstream) == "$PIN_UPSTREAM" ]] || { echo "provenance upstream ($(p upstream)) does not match build/build.sh's pinned UPSTREAM ($PIN_UPSTREAM) - refusing to package"; exit 1; }
+[[ $(p upstream_tag) == "$PIN_TAG" ]] || { echo "provenance upstream_tag ($(p upstream_tag)) does not match build/build.sh's pinned TAG ($PIN_TAG) - refusing to package"; exit 1; }
+[[ $(p upstream_commit) == "$PIN_COMMIT" ]] || { echo "provenance upstream_commit ($(p upstream_commit)) does not match build/build.sh's pinned COMMIT ($PIN_COMMIT) - refusing to package"; exit 1; }
+
+PIN_UV_VER=$(sed -n 's/^UV_VER=//p' "$HERE/build.sh")
+PIN_UV_SHA256=$(sed -n 's/^UV_SHA256=//p' "$HERE/build.sh")
+PIN_HWLOC_VER=$(sed -n 's/^HWLOC_VER=//p' "$HERE/build.sh")
+PIN_HWLOC_SHA256=$(sed -n 's/^HWLOC_SHA256=//p' "$HERE/build.sh")
+PIN_SSL_VER=$(sed -n 's/^SSL_VER=//p' "$HERE/build.sh")
+PIN_SSL_SHA256=$(sed -n 's/^SSL_SHA256=//p' "$HERE/build.sh")
+[[ -n $PIN_UV_VER && -n $PIN_UV_SHA256 && -n $PIN_HWLOC_VER && -n $PIN_HWLOC_SHA256 && -n $PIN_SSL_VER && -n $PIN_SSL_SHA256 ]] \
+	|| { echo "build/build.sh: could not parse its own pinned dependency versions/hashes - refusing to package"; exit 1; }
+[[ $(p dep.libuv.version) == "$PIN_UV_VER" ]] || { echo "provenance dep.libuv.version ($(p dep.libuv.version)) does not match build/build.sh's pinned UV_VER ($PIN_UV_VER) - refusing to package"; exit 1; }
+[[ $(p dep.libuv.sha256) == "$PIN_UV_SHA256" ]] || { echo "provenance dep.libuv.sha256 does not match build/build.sh's pinned UV_SHA256 - refusing to package"; exit 1; }
+[[ $(p dep.hwloc.version) == "$PIN_HWLOC_VER" ]] || { echo "provenance dep.hwloc.version ($(p dep.hwloc.version)) does not match build/build.sh's pinned HWLOC_VER ($PIN_HWLOC_VER) - refusing to package"; exit 1; }
+[[ $(p dep.hwloc.sha256) == "$PIN_HWLOC_SHA256" ]] || { echo "provenance dep.hwloc.sha256 does not match build/build.sh's pinned HWLOC_SHA256 - refusing to package"; exit 1; }
+[[ $(p dep.openssl.version) == "$PIN_SSL_VER" ]] || { echo "provenance dep.openssl.version ($(p dep.openssl.version)) does not match build/build.sh's pinned SSL_VER ($PIN_SSL_VER) - refusing to package"; exit 1; }
+[[ $(p dep.openssl.sha256) == "$PIN_SSL_SHA256" ]] || { echo "provenance dep.openssl.sha256 does not match build/build.sh's pinned SSL_SHA256 - refusing to package"; exit 1; }
+
 # "helper" source files (everything BloxMiner-X adds on top of XMRig): build/build.sh recorded each one's
 # sha256 in $PROV at build time (helper.<path>.sha256=...). Recompute every one now and refuse to package on
 # any mismatch, so a package can never ship a helper source that does not match what the binary was built with.
-HELPERS=(bloxsense/blox.h bloxsense/blox_sys.cpp bloxsense/bloxsense.cpp
-         bloxminer-x/h-config.sh bloxminer-x/h-run.sh bloxminer-x/h-stats.sh bloxminer-x/h-manifest.conf
-         build/build.sh build/package.sh build/donate0.patch)
-for h in "${HELPERS[@]}"; do
-	want=$(p "helper.$h.sha256")
-	[[ -n $want ]] || { echo "build.provenance has no helper.$h.sha256 - rebuild with the current build/build.sh"; exit 1; }
-	got=$(sha256sum "$ROOT/$h" | cut -d' ' -f1)
-	[[ $got == "$want" ]] || { echo "$h changed since the build: provenance has $want, file is now $got - rebuild with build/build.sh before packaging"; exit 1; }
+# Release 1.0.1: the expected set is now DERIVED from build/build.sh's own current HELPERS array (never a
+# second, hand-maintained list here, which is exactly what let the two drift apart once already) and compared
+# in BOTH directions against what $PROV actually recorded - refusing on either a MISSING entry (expected right
+# now, but no longer recorded - e.g. build.sh gained a new helper after this build ran) or an EXTRA one
+# (recorded, but no longer expected - e.g. a stale entry from a renamed/removed file that would otherwise still
+# get silently hash-checked and reported as fine).
+mapfile -t expected_helpers < <(sed -n "/^HELPERS=(/,/)/p" "$HERE/build.sh" | tr -d '()' | sed 's/^HELPERS=//' | tr -s ' \t\n' '\n' | grep -v '^$')
+(( ${#expected_helpers[@]} > 0 )) || { echo "build/build.sh: could not parse its own HELPERS array - refusing to package"; exit 1; }
+
+helpers_checked=0
+declare -A recorded_helpers=()
+while IFS='=' read -r key val; do
+	[[ -n $key ]] || continue
+	hp=${key#helper.}; hp=${hp%.sha256}
+	[[ -n $hp ]] || continue
+	recorded_helpers[$hp]=1
+	[[ -f "$ROOT/$hp" ]] || { echo "$hp: recorded in $PROV as a build/build.sh HELPERS entry but missing from this repo - refusing to package"; exit 1; }
+	got=$(sha256sum "$ROOT/$hp" | cut -d' ' -f1)
+	[[ $got == "$val" ]] || { echo "$hp does not match its recorded source hash in $PROV (build/build.sh HELPERS) - refusing to package"; exit 1; }
+	helpers_checked=$((helpers_checked + 1))
+done < <(grep '^helper\.' "$PROV")
+(( helpers_checked > 0 )) || { echo "$PROV: no helper.*.sha256 entries found - build/build.sh HELPERS provenance is missing, refusing to package"; exit 1; }
+
+for h in "${expected_helpers[@]}"; do
+	[[ -n ${recorded_helpers[$h]:-} ]] || { echo "$h: expected by build/build.sh's own current HELPERS array but missing from $PROV's own helper.*.sha256 entries - refusing to package"; exit 1; }
+done
+for h in "${!recorded_helpers[@]}"; do
+	found=0
+	for e in "${expected_helpers[@]}"; do [[ $h == "$e" ]] && { found=1; break; }; done
+	(( found )) || { echo "$h: recorded in $PROV as a helper.*.sha256 entry but not in build/build.sh's own current HELPERS array - refusing to package"; exit 1; }
 done
 
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
@@ -77,7 +128,7 @@ Static dependencies (built from source by build/build.sh, sha256-pinned):
 
 Helper source files (everything BloxMiner-X adds on top of XMRig) - sha256 recorded at build time and
 verified unchanged by build/package.sh before this bundle was assembled:
-$(for h in "${HELPERS[@]}"; do printf '  %-40s %s\n' "$h" "$(sha256sum "$ROOT/$h" | cut -d' ' -f1)"; done)
+$(for h in "${expected_helpers[@]}"; do printf '  %-40s %s\n' "$h" "$(sha256sum "$ROOT/$h" | cut -d' ' -f1)"; done)
 SRC
 	if [[ $1 == src ]]; then
 		cat <<'SRC2'

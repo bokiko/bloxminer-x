@@ -214,7 +214,7 @@ task "tmgmt" "0-31"   # a management thread keeping the full mask must not confu
 bloxsense_says "$(fake_topo_json 16)"
 stats_case "per-core grouping, 16C/32T, bound and verified" 20001 "$SUM_OK" "$BACK_16C32T" \
 	'(.stats.hs | length) == 16 and .stats.uptime == 321 and .stats.ar == [15, 1] and .stats.cpu_power == 95 and
-	 .stats.ver == "bloxminer-x 1.0.0 (xmrig 6.26.0)" and .stats.algo == "rx/0" and
+	 .stats.ver == "bloxminer-x 1.0.1 (xmrig 6.26.0)" and .stats.algo == "rx/0" and
 	 (.stats.hs[0] == (((100 + 0) * 10 + (100 + 16) * 10) / 1000)) and (.stats.temp[0] == 55)'
 
 BACK_NULLS=$(python3 - <<'PY'
@@ -224,10 +224,18 @@ threads[2]["hashrate"][0] = 5000.0
 print(json.dumps([{"type": "cpu", "threads": threads}]))
 PY
 )
+# Release 1.0.1: a null thread rate (hashrate[0] missing/invalid) makes that row's OWN khs null, never a
+# fabricated 0 silently summed in - so a backends reply with even one null-rate thread is INCOMPLETE as a
+# whole and never replaces Phase A's own fresh total (the single `/2/summary` call's own aggregate rate),
+# which is exactly what protects a real, positive rate from being zeroed out by an incomplete per-core/
+# per-thread breakdown. SUM_HEALTHY's own hashrate.total carries the real rate (5.00 kH/s, matching the one
+# thread here that DID report a number) for Phase A to answer with on its own.
+SUM_HEALTHY_5=$(jq -nc '{uptime: 321, connection: {accepted: 15, rejected: 1}, algo: "rx/0", version: "6.26.0",
+	hashrate: {total: [5000, null, null]}}')
 reset_proc; listen 20002 1002 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "null thread rates treated as 0" 20002 "$SUM_OK" "$BACK_NULLS" \
-	'.stats.hs == [0, 0, 5, 0] and .khs == "5.00"'
+stats_case "healthy summary + backends with a null thread rate -> Phase B incomplete, Phase A's own total stands" \
+	20002 "$SUM_HEALTHY_5" "$BACK_NULLS" '.khs == "5.00" and (.stats.hs | length) == 1 and .stats.hs[0] == 5'
 
 BACK_ZERO=$(python3 - <<'PY'
 import json
@@ -259,27 +267,37 @@ bloxsense_says "$(fake_topo_json 4)"
 stats_case "affinity == -1 -> per-thread rows, package temp" 20006 "$SUM_OK" "$BACK_UNBOUND" \
 	'(.stats.hs | length) == 4 and (.stats.temp | unique) == [70]'
 
+# BACK_SOME_REAL: 4 threads, all REAL non-null positive rates - deliberately NOT BACK_NULLS here, so these
+# three cases exercise percore/verification structure on its own, without being confounded by the null-rate
+# incompleteness behavior covered separately above.
+BACK_SOME_REAL=$(python3 - <<'PY'
+import json
+threads = [{"affinity": c, "hashrate": [r, None, None]} for c, r in zip(range(4), [1000.0, 2000.0, 1500.0, 2500.0])]
+print(json.dumps([{"type": "cpu", "threads": threads}]))
+PY
+)
+
 reset_proc; listen 20007 1007 "$BLOX_DIR/xmrig"
 task "t0" "0"; task "t1" "1"; task "t2" "2"   # thread for cpu 3 never shows a single-CPU mask: verification fails
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "affinity not independently confirmed -> per-thread rows, package temp" 20007 "$SUM_OK" "$BACK_NULLS" \
+stats_case "affinity not independently confirmed -> per-thread rows, package temp" 20007 "$SUM_OK" "$BACK_SOME_REAL" \
 	'(.stats.hs | length) == 4 and (.stats.temp | unique) == [70]'
 
 reset_proc; listen 20008 1008 "$BLOX_DIR/xmrig"
 task "t0" "0"; task "t1" "1"; task "t2" "1"; task "t3" "3"   # cpu 1 pinned twice, cpu 2 never -> multiset mismatch
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "duplicate task pinning -> multiset mismatch -> per-thread rows" 20008 "$SUM_OK" "$BACK_NULLS" \
+stats_case "duplicate task pinning -> multiset mismatch -> per-thread rows" 20008 "$SUM_OK" "$BACK_SOME_REAL" \
 	'(.stats.temp | unique) == [70]'
 
 reset_proc; listen 20009 1009 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "numeric JSON types throughout" 20009 "$SUM_OK" "$BACK_NULLS" \
+stats_case "numeric JSON types throughout" 20009 "$SUM_OK" "$BACK_SOME_REAL" \
 	'(.stats.ar | map(type) | unique) == ["number"] and (.stats.uptime | type) == "number" and
 	 (.stats.hs | map(type) | unique) == ["number"] and (.khs | type) == "string" and (.khs | tonumber | type) == "number"'
 
 reset_proc; listen 20011 1011 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4 95.5)"
-stats_case "fractional power_w (95.5) is not dropped" 20011 "$SUM_OK" "$BACK_NULLS" '.stats.cpu_power == 95.5'
+stats_case "fractional power_w (95.5) is not dropped" 20011 "$SUM_OK" "$BACK_SOME_REAL" '.stats.cpu_power == 95.5'
 
 BACK_BAD_TYPES=$(python3 - <<'PY'
 import json
@@ -289,14 +307,14 @@ PY
 )
 reset_proc; listen 20012 1012 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "malformed JSON types (affinity as string) -> full fallback" 20012 "$SUM_OK" "$BACK_BAD_TYPES" \
-	'.khs == "0" and .stats.hs == [0]'
+stats_case "healthy summary + malformed backends (affinity as string) -> Phase B skipped, Phase A's total stands" \
+	20012 "$SUM_HEALTHY_5" "$BACK_BAD_TYPES" '.khs == "5.00" and (.stats.hs | length) == 1 and .stats.hs[0] == 5'
 
 BACK_NO_HASHRATE_ARRAY=$(jq -nc '[{"type": "cpu", "threads": [{"affinity": 0, "hashrate": "not-an-array"}]}]')
 reset_proc; listen 20013 1013 "$BLOX_DIR/xmrig"; task "t0" "0"
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "malformed JSON types (hashrate not an array) -> full fallback" 20013 "$SUM_OK" "$BACK_NO_HASHRATE_ARRAY" \
-	'.khs == "0" and .stats.hs == [0]'
+stats_case "healthy summary + malformed backends (hashrate not an array) -> Phase B skipped, Phase A's total stands" \
+	20013 "$SUM_OK" "$BACK_NO_HASHRATE_ARRAY" '.khs == "0.00" and .stats.hs == [0]'
 
 BACK_NEGATIVE=$(python3 - <<'PY'
 import json
@@ -314,7 +332,95 @@ BACK_NO_THREADS_KEY=$(jq -nc '[{"type": "cpu", "algo": null}]')   # legitimate: 
 reset_proc; listen 20015 1015 "$BLOX_DIR/xmrig"
 bloxsense_says "$(fake_topo_json 4)"
 stats_case "cpu backend with no threads key yet (pre-first-job) -> hs [0], khs 0" 20015 "$SUM_OK" "$BACK_NO_THREADS_KEY" \
-	'.khs == "0" and .stats.hs == [0]'
+	'.khs == "0.00" and .stats.hs == [0]'
+
+# ---- empty API output: the API is listening (unlike "API down" above) but answers with an empty/erroring
+# body (HTTP 500 from fake_xmrig_api.py's own "null body" convention) - curl -fsS then returns empty stdout,
+# which must be refused the SAME way as a genuinely malformed reply (jq 1.6's `-e` exits 0 on empty input -
+# see valid_summary()/valid_backends()'s own header), never silently treated as "valid but empty".
+reset_proc; listen 20031 1031 "$BLOX_DIR/xmrig"
+bloxsense_says "$(fake_topo_json 4)"
+stats_case "empty /2/summary body (API up, HTTP 500) -> unavailable, khs 0" 20031 "" "" '.khs == "0" and .stats.hs == [0]'
+jq -n --argjson s null --argjson b null '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20031 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+export BLOX_API_PORT=20031
+res=$(bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+if [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "empty /2/summary body (API up, HTTP 500) -> unavailable, khs 0"
+else
+	bad "empty /2/summary body (API up, HTTP 500) -> unavailable, khs 0" "$res"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+
+# ---- empty sensor output: a healthy summary AND healthy, complete, non-null backends, but bloxsense itself
+# produces empty output (crashes silently / killed before writing anything) - Phase B must still fall back to
+# its own safe default ({"cpus":[],"pkg_temp":null,"power_w":null,...}) rather than feed an empty $sense into
+# the jq --argjson calls further down (a hard, fatal argument error there, not a graceful "not verified"
+# outcome) - the RATE itself (fully independent of sensors) must still come through correctly.
+reset_proc; listen 20032 1032 "$BLOX_DIR/xmrig"   # no tasks set up: affinity never independently confirmed,
+	# so this takes the per-thread (not per-core) path regardless of the empty sensor output below
+cat > "$BLOX_DIR/bloxsense" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$BLOX_DIR/bloxsense"
+stats_case "empty bloxsense output (healthy summary+backends) -> safe sensor default, rate still correct" \
+	20032 "$SUM_OK" "$BACK_SOME_REAL" '.stats.temp == [null, null, null, null] and (.stats.hs | add) == 7'
+bloxsense_says "$(fake_topo_json 4)"
+
+# ---- inconsistent totals: Phase A's own fresh total is healthy and positive, but Phase B's own (complete,
+# no nulls) total disagrees with it by far more than the 10% tolerance - treated as INCONSISTENT, never as a
+# fresher answer, so Phase A's own total (the one `/2/summary` call XMRig itself just answered) stands. This is
+# the false-zero class this whole split exists to prevent: a near-zero (or just very different) Phase B total
+# must never quietly overrule a real, fresh, positive Phase A rate.
+SUM_HEALTHY_50=$(jq -nc '{uptime: 321, connection: {accepted: 15, rejected: 1}, algo: "rx/0", version: "6.26.0",
+	hashrate: {total: [50000, null, null]}}')   # 50.00 kH/s - BACK_SOME_REAL's own total (7.00 kH/s) disagrees by far more than 10%
+reset_proc; listen 20033 1033 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+stats_case "healthy summary (50 kH/s) + complete but wildly disagreeing backends (7 kH/s) -> Phase A's total stands" \
+	20033 "$SUM_HEALTHY_50" "$BACK_SOME_REAL" '.khs == "50.00" and (.stats.hs | length) == 1 and .stats.hs[0] == 50'
+
+# ---- failed stats composition: BLOX_HSTATS_TEST_FORCE_STATS_FAIL simulates the transient jq/fork failure
+# class the composition's own validate-before-write guard exists for (see run()'s own header comment) - makes
+# power_raw not valid JSON right before the final --argjson composition, so that jq call fails fatally. Phase
+# A's own already-written result must be left completely untouched, never partially overwritten.
+reset_proc; listen 20034 1034 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+jq -n --argjson s "$SUM_HEALTHY_5" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20034 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+export BLOX_API_PORT=20034 BLOX_HSTATS_TEST_FORCE_STATS_FAIL=1
+res=$(bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+unset BLOX_HSTATS_TEST_FORCE_STATS_FAIL
+if [[ $(jq -r '.khs == "5.00" and (.stats.hs | length) == 1 and .stats.hs[0] == 5' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "forced stats-composition failure -> Phase A's already-written result stands untouched"
+else
+	bad "forced stats-composition failure -> Phase A's already-written result stands untouched" "$res"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+
+# ---- repeated polls in one sourced shell: Hive's real agent sources h-stats.sh repeatedly in the SAME shell,
+# poll after poll - $khs/$stats are plain globals, so a poll that collects nothing must never let a PREVIOUS
+# poll's positive values stand as if they were this poll's own fresh answer (the top-of-file unconditional
+# reset is exactly what prevents that). First poll: healthy, positive. Second poll, same shell: API now down.
+reset_proc; listen 20035 1035 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+jq -n --argjson s "$SUM_HEALTHY_50" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20035 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+res=$(BLOX_API_PORT=20035 API_PID="$API_PID" bash -c '
+	. "$BLOX_DIR/h-stats.sh"; khs1=$khs
+	kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+	. "$BLOX_DIR/h-stats.sh"
+	jq -nc --arg k1 "$khs1" --arg k2 "$khs" --arg s2 "$stats" "{khs1: \$k1, khs2: \$k2, stats2: (\$s2 | fromjson)}"
+' 2>&1)
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+if [[ $(jq -r '.khs1 == "50.00" and .khs2 == "0" and .stats2.hs == [0]' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "repeated polls, one sourced shell: a dead second poll never inherits the first poll's positive rate"
+else
+	bad "repeated polls, one sourced shell: a dead second poll never inherits the first poll's positive rate" "$res"
+fi
 
 # ---- budget: ONE shared 3.0 s deadline - a slow step gets whatever is left, never more, and the whole run
 #      (ownership check + both curls + bloxsense) stays comfortably under 3.2 s wall time even in bad cases.
@@ -451,7 +557,7 @@ export BLOX_API_PORT=20019
 run_hstats_timed
 sleep 0.5   # let init reap anything that died, before checking for survivors
 survivors1=$(pgrep -f "$MARKER1" || true)
-if awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' && [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]] && [[ -z $survivors1 ]]; then
+if awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' && [[ $(jq -r '.khs == "0.00" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]] && [[ -z $survivors1 ]]; then
 	ok "SIGTERM-ignoring bloxsense: killed, no survivors, < 3.0 s (${elapsed}s)"
 else
 	bad "SIGTERM-ignoring bloxsense: killed, no survivors, < 3.0 s" "elapsed=${elapsed}s survivors=[$survivors1] $res"
@@ -525,7 +631,7 @@ caller_alive=$(pgrep -f "$CALLER_MARKER" || true)
 bloxsense_survivors=$(pgrep -f "$MARKER3" || true)
 elapsed=$(jq -r '.elapsed' <<< "$res" 2>/dev/null); [[ -n $elapsed && $elapsed != null ]] || elapsed=99
 if [[ -n $caller_alive ]] && [[ -z $bloxsense_survivors ]] && awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' \
-	&& [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]]
+	&& [[ $(jq -r '.khs == "0.00" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]]
 then
 	ok "process-group isolation: caller's group survives, bloxsense reaped, < 3.0 s (${elapsed}s)"
 else

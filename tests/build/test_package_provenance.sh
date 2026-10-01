@@ -51,26 +51,26 @@ fake_out() {   # (re)writes $T/out: fake xmrig/bloxsense "binaries" + a build.pr
 run_package() { rm -rf "$T/pkgout"; mkdir -p "$T/pkgout"; ( cd "$REPO" && bash build/package.sh "$T/out" "$T/pkgout" ) > "$T/pkg.out" 2>&1; }
 
 fake_out
-if run_package && [[ -f $T/pkgout/bloxminer-x-1.0.0.tar.gz && -f $T/pkgout/bloxminer-x-1.0.0-src.tar.gz ]]; then
+if run_package && [[ -f $T/pkgout/bloxminer-x-1.0.1.tar.gz && -f $T/pkgout/bloxminer-x-1.0.1-src.tar.gz ]]; then
 	ok "baseline: untampered sources -> package.sh succeeds, both artefacts produced"
 else
 	bad "baseline: untampered sources -> package.sh succeeds, both artefacts produced" "$(cat "$T/pkg.out")"
 fi
 
 echo "// tampered $RANDOM" >> "$REPO/bloxminer-x/h-stats.sh"   # provenance still has the OLD hash
-if ! run_package && grep -q "bloxminer-x/h-stats.sh changed since the build" "$T/pkg.out"; then
+if ! run_package && grep -q "bloxminer-x/h-stats.sh does not match its recorded source hash" "$T/pkg.out"; then
 	ok "tampered h-stats.sh (after build) -> package.sh refuses"
 else
 	bad "tampered h-stats.sh (after build) -> package.sh refuses" "rc=$? out=$(cat "$T/pkg.out")"
 fi
-if [[ ! -f $T/pkgout/bloxminer-x-1.0.0.tar.gz ]]; then ok "tampered h-stats.sh -> no package written"; else bad "tampered h-stats.sh -> no package written" "package exists"; fi
+if [[ ! -f $T/pkgout/bloxminer-x-1.0.1.tar.gz ]]; then ok "tampered h-stats.sh -> no package written"; else bad "tampered h-stats.sh -> no package written" "package exists"; fi
 
 fake_out   # re-snapshot: now the (tampered) content IS what provenance expects -> must succeed again
 if run_package; then ok "re-snapshotted provenance after edit -> succeeds again (checks current content, not a fixed list)"; else bad "re-snapshotted provenance after edit -> succeeds again" "$(cat "$T/pkg.out")"; fi
 
 fake_out
 echo "; tampered bloxsense $RANDOM" >> "$REPO/bloxsense/blox_sys.cpp"
-if ! run_package && grep -q "bloxsense/blox_sys.cpp changed since the build" "$T/pkg.out"; then
+if ! run_package && grep -q "bloxsense/blox_sys.cpp does not match its recorded source hash" "$T/pkg.out"; then
 	ok "tampered blox_sys.cpp -> package.sh refuses"
 else
 	bad "tampered blox_sys.cpp -> package.sh refuses" "out=$(cat "$T/pkg.out")"
@@ -86,10 +86,89 @@ fi
 
 fake_out
 sed -i '/^helper\.bloxminer-x\/h-run\.sh\.sha256=/d' "$T/out/build.provenance"   # simulate an old-style provenance
-if ! run_package && grep -q "no helper.bloxminer-x/h-run.sh.sha256" "$T/pkg.out"; then
+if ! run_package && grep -q "bloxminer-x/h-run.sh: expected by build/build.sh's own current HELPERS array but missing" "$T/pkg.out"; then
 	ok "missing helper hash in provenance -> package.sh refuses"
 else
 	bad "missing helper hash in provenance -> package.sh refuses" "out=$(cat "$T/pkg.out")"
+fi
+
+# ---- pin verification: upstream/tag/commit and dependency versions+hashes must match build/build.sh's OWN
+# pinned literals, not just be self-consistent with the provenance file alone (an outdir built from some other
+# xmrig revision or dependency set could otherwise pass every self-consistency check above and still ship).
+fake_out
+sed -i.bak 's|^upstream=.*|upstream=https://github.com/attacker/xmrig|' "$T/out/build.provenance"
+if ! run_package && grep -qF "pinned UPSTREAM" "$T/pkg.out"; then
+	ok "tampered provenance upstream -> package.sh refuses"
+else
+	bad "tampered provenance upstream -> package.sh refuses" "out=$(cat "$T/pkg.out")"
+fi
+
+fake_out
+sed -i.bak 's/^upstream_tag=.*/upstream_tag=v99.0.0/' "$T/out/build.provenance"
+if ! run_package && grep -qF "pinned TAG" "$T/pkg.out"; then
+	ok "tampered provenance upstream_tag -> package.sh refuses"
+else
+	bad "tampered provenance upstream_tag -> package.sh refuses" "out=$(cat "$T/pkg.out")"
+fi
+
+fake_out
+sed -i.bak 's/^upstream_commit=.*/upstream_commit=0000000000000000000000000000000000000000/' "$T/out/build.provenance"
+if ! run_package && grep -qF "pinned COMMIT" "$T/pkg.out"; then
+	ok "tampered provenance upstream_commit -> package.sh refuses"
+else
+	bad "tampered provenance upstream_commit -> package.sh refuses" "out=$(cat "$T/pkg.out")"
+fi
+
+fake_out
+sed -i.bak 's/^dep.libuv.version=.*/dep.libuv.version=9.9.9/' "$T/out/build.provenance"
+if ! run_package && grep -qF "pinned UV_VER" "$T/pkg.out"; then
+	ok "tampered provenance dep.libuv.version -> package.sh refuses"
+else
+	bad "tampered provenance dep.libuv.version -> package.sh refuses" "out=$(cat "$T/pkg.out")"
+fi
+
+fake_out
+sed -i.bak 's/^dep.hwloc.sha256=.*/dep.hwloc.sha256=0000000000000000000000000000000000000000000000000000000000000000/' "$T/out/build.provenance"
+if ! run_package && grep -qF "pinned HWLOC_SHA256" "$T/pkg.out"; then
+	ok "tampered provenance dep.hwloc.sha256 -> package.sh refuses"
+else
+	bad "tampered provenance dep.hwloc.sha256 -> package.sh refuses" "out=$(cat "$T/pkg.out")"
+fi
+
+fake_out
+sed -i.bak 's/^dep.openssl.version=.*/dep.openssl.version=9.9.9/' "$T/out/build.provenance"
+if ! run_package && grep -qF "pinned SSL_VER" "$T/pkg.out"; then
+	ok "tampered provenance dep.openssl.version -> package.sh refuses"
+else
+	bad "tampered provenance dep.openssl.version -> package.sh refuses" "out=$(cat "$T/pkg.out")"
+fi
+
+# ---- "Require every expected helper provenance entry" - the gate must require EVERY currently-expected
+# helper (derived from build/build.sh's own HELPERS array) to be present in the provenance, not just "at least
+# one helper.*.sha256 line matches". Deletes ONLY h-run.sh's own line - every other helper stays correctly
+# recorded - and asserts package.sh refuses, naming the specific missing helper.
+fake_out
+sed -i.bak '/^helper\.bloxminer-x\/h-run\.sh\.sha256=/d' "$T/out/build.provenance"
+if ! run_package && grep -qF "bloxminer-x/h-run.sh" "$T/pkg.out" && grep -qF "missing from" "$T/pkg.out"; then
+	ok "provenance with exactly ONE helper.*.sha256 line deleted (others still valid) -> package.sh refuses"
+else
+	bad "provenance with exactly ONE helper.*.sha256 line deleted (others still valid) -> package.sh refuses" "out=$(cat "$T/pkg.out")"
+fi
+
+# ---- an EXTRA/unknown helper.*.sha256 entry - one that does not correspond to anything build/build.sh's own
+# HELPERS array currently lists (e.g. a stale leftover from a renamed/removed file, or a hand-edited addition)
+# - must also refuse, not silently hash-check it and report fine. The extra entry's own hash is deliberately
+# CORRECT (sha256 of a real file in this repo) - the refusal must come from it not being an expected helper at
+# all, never from a coincidental hash mismatch.
+fake_out
+# LICENSE: a real file that DOES exist in the test's own disposable $REPO copy (so the "does this file even
+# exist" check passes) but is NOT one of build/build.sh's HELPERS entries - the refusal below must come from
+# it not being an expected helper at all, never from a missing file or a coincidental hash mismatch.
+printf 'helper.LICENSE.sha256=%s\n' "$(sha256sum "$REPO/LICENSE" | cut -d' ' -f1)" >> "$T/out/build.provenance"
+if ! run_package && grep -qF "LICENSE" "$T/pkg.out" && grep -qF "not in build/build.sh's own current HELPERS array" "$T/pkg.out"; then
+	ok "provenance with an EXTRA/unknown helper.*.sha256 entry -> package.sh refuses"
+else
+	bad "provenance with an EXTRA/unknown helper.*.sha256 entry -> package.sh refuses" "out=$(cat "$T/pkg.out")"
 fi
 
 echo "$pass passed, $fail failed"
