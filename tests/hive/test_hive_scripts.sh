@@ -732,6 +732,44 @@ else
 fi
 pkill -9 -f "$MARKER2" 2>/dev/null
 
+# ---- P2 (bot review): OUTFILE and HANDSHAKE are two SEPARATE mktemp calls - one can succeed while the other
+# fails (e.g. /tmp genuinely out of inodes/quota mid-poll). The `else` branch used to assume "neither
+# succeeded" and never removed whichever ONE actually did, leaking a real file on disk every time this
+# happened - sourced repeatedly in the same long-lived Hive agent shell, that is a file per such poll. A
+# PATH-stub `mktemp` that succeeds for its first two calls (LIB, then OUTFILE) and fails from the third call
+# (HANDSHAKE) onward reproduces exactly that split outcome.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+REAL_MKTEMP=$(command -v mktemp)
+FAKEBIN3="$T/fakebin3"; mkdir -p "$FAKEBIN3"
+MKTEMP_COUNT_FILE="$T/mktemp_count"; echo 0 > "$MKTEMP_COUNT_FILE"
+cat > "$FAKEBIN3/mktemp" <<EOF
+#!/bin/bash
+n=\$(cat "$MKTEMP_COUNT_FILE" 2>/dev/null || echo 0)
+n=\$((n + 1))
+echo "\$n" > "$MKTEMP_COUNT_FILE"
+if [[ \$n -ge 3 ]]; then
+	exit 1
+fi
+exec "$REAL_MKTEMP" "\$@"
+EOF
+chmod +x "$FAKEBIN3/mktemp"
+TMPDIR3="$T/tmpdir3"; mkdir -p "$TMPDIR3"
+reset_proc; listen 20043 1043 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+jq -n --argjson s "$SUM_HEALTHY_5" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20043 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+OLDPATH=$PATH
+res=$(PATH="$FAKEBIN3:$PATH" TMPDIR="$TMPDIR3" BLOX_API_PORT=20043 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+export PATH=$OLDPATH
+leftover3=$(find "$TMPDIR3" -type f 2>/dev/null)
+if [[ -z $leftover3 ]] && [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "mktemp: OUTFILE succeeds, HANDSHAKE fails -> no leftover temp file, honest fallback"
+else
+	bad "mktemp: OUTFILE succeeds, HANDSHAKE fails -> no leftover temp file, honest fallback" "leftover=[$leftover3] res=$res"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+
 # ---- process-group isolation: the parent must never read/trust the child's pgid before the child itself has
 #      confirmed (via a handshake, written only AFTER its own setsid takes effect) that it is truly isolated -
 #      otherwise a premature read could see the CALLER's own (inherited) pgid, and a later group-kill could

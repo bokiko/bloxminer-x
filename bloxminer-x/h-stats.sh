@@ -631,6 +631,12 @@ KILL_GRACE=0.3      # extra time after SIGTERM before SIGKILL - bounds the hard 
 # captured from the child's stdout. Never a pipe: a command-substitution pipe only reaches EOF once every
 # process that ever held its write end (including an orphan that somehow escaped the kill) has closed it, so a
 # survivor could hang this parent forever. Reading a plain file back never blocks on a stale writer.
+# P2 (bot review): both OUTFILE and HANDSHAKE are reset to empty HERE, unconditionally, before either mktemp is
+# even attempted - this file is sourced repeatedly in the SAME shell (Hive's own agent, poll after poll; see
+# this package's own "repeated polls" test), so these are plain, non-local globals that could otherwise still
+# hold a PREVIOUS poll's own path if some future edit ever restructured this block in a way that skipped one of
+# the assignments below - resetting first means there is never a stale path left around to accidentally act on.
+OUTFILE=""; HANDSHAKE=""
 OUTFILE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-x-hstats-out.XXXXXX") || OUTFILE=""
 # The child reports its OWN pgid, AFTER its setsid has taken effect, into this handshake file - this script
 # never reads the child's pgid via `ps` itself. Right after backgrounding, the new process may still be
@@ -756,6 +762,14 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# parent (Hive's agent, or whatever sourced this file) eventually exits. Trading a worst-case INDEFINITE
 	# hang for, at most, one transient zombie entry between polls is the right side of that trade.
 else
+	# P2 (bot review): at least one of the two mktemp calls above failed - but NOT NECESSARILY both. If OUTFILE
+	# succeeded and only HANDSHAKE failed (or vice versa), the one that DID succeed is a real file already sitting
+	# on disk that nothing else will ever remove: the collection never even starts in this branch, so run()'s own
+	# atomic tmp+rename into $OUTFILE never happens, and the "if" branch's own `rm -f "$OUTFILE" "$HANDSHAKE"`
+	# never runs either. Sourced repeatedly in the same long-lived Hive agent shell, that leaked a file per such
+	# poll (e.g. /tmp genuinely out of inodes/quota - exactly the condition under which a mktemp failure here is
+	# most likely in the first place). `rm -f` on whichever variable is still empty is always a safe no-op.
+	rm -f "$OUTFILE" "$HANDSHAKE"
 	result=""
 fi
 rm -f "$LIB"

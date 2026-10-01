@@ -212,17 +212,77 @@ sleep 0.3
 N_POLLS=60
 HARD_CAP=4.0
 n_zero=0; n_over_budget=0; n_hardfail=0; max_elapsed=0
+# ---- CI diagnostics (GitHub Actions hit a real 5.01 s hard-cap breach + false-zero on this exact case, twice,
+# that ai02 cannot reproduce under any load/taskset combination tried - so reason from a trace instead of
+# guessing further). Every poll gets its own BLOX_HSTATS_DEBUG_LOG (run()'s own dbg() timestamps, already
+# built into h-stats.sh) and its own `set -x` trace (PS4 timestamped via EPOCHREALTIME, BASH_XTRACEFD so it
+# never mixes into the poll's own stdout/stderr capture) of the WHOLE sourced call, not just run() - covering
+# every parent-side step too (mktemp, ps, the result read-back, the final jq parse - none of which carry their
+# own per-step timeout the way run()'s own child-side steps do). A watchdog checks, WITHOUT blocking the outer
+# `timeout 5` itself, whether the poll is still alive at ~4.6 s (before that external timeout can fire) and
+# dumps `ps` for the WHOLE system at that instant if so - the one piece of evidence that would show exactly
+# which process is still running and in what state (D/S/Z, wchan) the moment everything gets killed. Logs for
+# a PASSING poll are deleted immediately (kept quiet, bounded disk use over 60 polls); a HARDFAIL or ZERO poll
+# dumps its full debug log, its last ~150 trace lines, and any watchdog ps dump straight into this test's own
+# output, so the next CI failure carries the trace instead of just the bare numbers.
 for i in $(seq 1 "$N_POLLS"); do
+	DBGLOG="$T/dbg_poll_$i.log"; TRACELOG="$T/trace_poll_$i.log"; PSLOG="$T/ps_poll_$i.log"; OUTLOG="$T/out_poll_$i.log"
+	rm -f "$DBGLOG" "$TRACELOG" "$PSLOG" "$OUTLOG"
 	t0=$(date +%s.%N)
-	# shellcheck disable=SC2016
-	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+	# shellcheck disable=SC2016   # $BLOX_DIR/$khs/$tfd/$BASH_SOURCE/$LINENO are meant to expand in the INNER
+	# bash -c (at trace time, or via that shell's own env), never here - the one exception is $TRACELOG, which
+	# must be the OUTER (per-poll) path, so it is deliberately closed out of the single-quoted string instead.
+	BLOX_HSTATS_DEBUG_LOG="$DBGLOG" timeout 5 bash -c '
+		exec {tfd}>"'"$TRACELOG"'"
+		export BASH_XTRACEFD=$tfd
+		PS4="+ ${EPOCHREALTIME:-?} ${BASH_SOURCE##*/}:${LINENO}: "
+		set -x
+		. "$BLOX_DIR/h-stats.sh"
+		set +x
+		echo "khs=[$khs]"
+	' > "$OUTLOG" 2>&1 &
+	POLL_PID=$!
+	watchdog_fired=0
+	for w in $(seq 1 28); do   # 28 x 0.2 s = 5.6 s - a backstop past the inner `timeout 5` itself, never relied
+		kill -0 "$POLL_PID" 2>/dev/null || break                       # on to actually bound anything by itself
+		if [[ $w -eq 23 && $watchdog_fired == 0 ]]; then   # ~4.6 s - before the inner timeout's own 5.0 s fires
+			watchdog_fired=1
+			{
+				echo "WATCHDOG: poll $i still running at ~${w}x0.2s, dumping ps"
+				# Filtered to this poll's own candidate processes, never the whole system table - a real run
+				# has hundreds of unrelated kernel threads/services that would otherwise bury the one thing
+				# this exists to show. The header line always matches "CMD" too, so it survives the filter.
+				# shellcheck disable=SC2009   # pgrep cannot report stat/wchan/etime together - that is the
+				# whole point of this dump, not something pgrep -a or an equivalent could replace here.
+				# Deliberately NOT a bare "bash" term: on a shared/busy host (CI runners are not, but ai02 is)
+				# that alone matches every unrelated bash process system-wide - "h-stats.sh" alone is enough
+				# to catch the actual wrapper, since its own cmdline embeds the whole sourced script's path.
+				ps -eo pid,ppid,pgid,stat,wchan:20,etime,cmd 2>/dev/null | grep -iE 'CMD|h-stats|curl|bloxsense|xmrig|mktemp|awk|find|timeout|readlink|jq|ps -eo'
+			} > "$PSLOG" 2>&1
+		fi
+		sleep 0.2
+	done
+	wait "$POLL_PID" 2>/dev/null
 	t1=$(date +%s.%N)
+	res=$(cat "$OUTLOG" 2>/dev/null)
 	elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
 	pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
-	awk -v k="${pkhs:-0}" 'BEGIN{exit !(k>0)}' || { n_zero=$((n_zero+1)); echo "  poll $i: ZERO khs ($res)"; }
+	poll_bad=0
+	awk -v k="${pkhs:-0}" 'BEGIN{exit !(k>0)}' || { n_zero=$((n_zero+1)); poll_bad=1; echo "  poll $i: ZERO khs ($res)"; }
 	awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' || { n_over_budget=$((n_over_budget+1)); echo "  poll $i: OVER BUDGET (${elapsed}s)"; }
-	awk -v e="$elapsed" -v c="$HARD_CAP" 'BEGIN{exit !(e > c)}' && { n_hardfail=$((n_hardfail+1)); echo "  poll $i: HARD CAP EXCEEDED (${elapsed}s > ${HARD_CAP}s)"; }
+	awk -v e="$elapsed" -v c="$HARD_CAP" 'BEGIN{exit !(e > c)}' && { n_hardfail=$((n_hardfail+1)); poll_bad=1; echo "  poll $i: HARD CAP EXCEEDED (${elapsed}s > ${HARD_CAP}s)"; }
 	awk -v e="$elapsed" -v m="$max_elapsed" 'BEGIN{exit !(e > m)}' && max_elapsed=$elapsed
+	if (( poll_bad )); then
+		echo "  poll $i: --- BLOX_HSTATS_DEBUG_LOG ---"
+		sed 's/^/  poll '"$i"' dbg: /' "$DBGLOG" 2>/dev/null
+		echo "  poll $i: --- last ~150 trace lines ---"
+		tail -n 150 "$TRACELOG" 2>/dev/null | sed 's/^/  poll '"$i"' trace: /'
+		if [[ -s $PSLOG ]]; then
+			echo "  poll $i: --- watchdog ps dump (~4.6s) ---"
+			sed 's/^/  poll '"$i"' ps: /' "$PSLOG"
+		fi
+	fi
+	rm -f "$DBGLOG" "$TRACELOG" "$PSLOG" "$OUTLOG"
 done
 stop_saturating
 n_ok_budget=$((N_POLLS - n_over_budget)); n_need_budget=$(( (N_POLLS * 9 + 9) / 10 ))
