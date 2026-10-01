@@ -133,20 +133,69 @@ for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 grep -q ready "$T/api.out" || { bad "fake /proc under full CPU load" "fake API did not start: $(cat "$T/api.out")"; }
 
 export BLOX_DIR BLOX_PROCFS_ROOT="$PROC" BLOX_API_PORT=4069
+# P2 (bot review): under full-host saturation, Phase B legitimately does not always finish in time - falling
+# back to Phase A's own single-row total is the DESIGNED degradation (see the file header's whole Phase A/B
+# split), not a bug, so a bare "must be exactly 16 rows" assertion here could fail CI on a contended runner
+# with no real regression. Not simply dropped, though: this fixture's own 16-row shape is what caught a real
+# per-core regression before (f619829) - split into two checks instead. This one tolerates the fallback (EITHER
+# 16 per-core rows OR exactly Phase A's 1-row total, counted and printed), but still requires the SAME expected
+# total and a valid stats shape either way - a dedicated, UNLOADED regression guard for "16 rows, every time"
+# follows right after this one.
 saturate_cpus
 sleep 0.3   # let the busy loops actually load every core before measuring
-t0=$(date +%s.%N)
-# shellcheck disable=SC2016
-res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
-t1=$(date +%s.%N)
+N_POLLS1=5
+n_percore=0; n_fallback=0; n_bad1=0; max_elapsed1=0
+for i in $(seq 1 "$N_POLLS1"); do
+	t0=$(date +%s.%N)
+	# shellcheck disable=SC2016
+	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+	t1=$(date +%s.%N)
+	elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+	awk -v e="$elapsed" -v m="$max_elapsed1" 'BEGIN{exit !(e > m)}' && max_elapsed1=$elapsed
+	khs=$(jq -r '.khs' <<< "$res" 2>/dev/null)
+	nrows=$(jq -r '.stats.hs | length' <<< "$res" 2>/dev/null)
+	valid_shape=false
+	jq -e '(.stats | type) == "object" and (.stats.hs | type) == "array" and (.stats.hs | length) > 0 and
+		(.stats.hs | all(type == "number")) and (.stats.temp | type) == "array"' > /dev/null 2>&1 <<< "$res" && valid_shape=true
+	poll1_bad=1
+	if awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' && [[ $khs == 16.50 ]] && [[ $valid_shape == true ]]; then
+		if [[ $nrows == 16 ]]; then n_percore=$((n_percore+1)); poll1_bad=0
+		elif [[ $nrows == 1 ]]; then n_fallback=$((n_fallback+1)); poll1_bad=0
+		fi
+	fi
+	if (( poll1_bad )); then n_bad1=$((n_bad1+1)); echo "  poll $i: unexpected (elapsed=${elapsed}s khs=$khs rows=$nrows res=$res)"; fi
+done
 stop_saturating
-elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
-khs=$(jq -r '.khs' <<< "$res" 2>/dev/null)
-nrows=$(jq -r '.stats.hs | length' <<< "$res" 2>/dev/null)
-if awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' && awk -v k="${khs:-0}" 'BEGIN{exit !(k > 0)}' && [[ ${nrows:-0} == 16 ]]; then
-	ok "fake /proc (~1500 fds/375 procs) under full CPU load: khs=$khs, 16 rows, < 3.0 s (${elapsed}s)"
+if (( n_bad1 == 0 )); then
+	ok "fake /proc (~1500 fds/375 procs) under full CPU load: khs=16.50 every poll, $n_percore/$N_POLLS1 per-core (16 rows), $n_fallback/$N_POLLS1 Phase A fallback (1 row), < 3.0 s (max ${max_elapsed1}s)"
 else
-	bad "fake /proc (~1500 fds/375 procs) under full CPU load: khs > 0, 16 rows, < 3.0 s" "elapsed=${elapsed}s khs=$khs rows=$nrows res=$res"
+	bad "fake /proc (~1500 fds/375 procs) under full CPU load: khs=16.50, 16-or-1 rows, valid shape, < 3.0 s, every poll" \
+		"n_bad=$n_bad1/$N_POLLS1 n_percore=$n_percore n_fallback=$n_fallback max=${max_elapsed1}s"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+
+# ---- the regression guard case 1's own relaxation above gives up: on an UNLOADED (or lightly loaded) CPU,
+# Phase B has no excuse not to finish - every poll must return the full 16 per-core rows, never the 1-row
+# fallback. This is what actually catches a per-core regression (the property f619829 fixed), now isolated from
+# the saturation tolerance above instead of conflated with it.
+python3 "$HERE/fake_xmrig_api.py" 4069 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+grep -q ready "$T/api.out" || bad "per-core regression guard: fake API startup" "$(cat "$T/api.out" 2>/dev/null)"
+N_POLLS1B=5
+n_bad1b=0
+for i in $(seq 1 "$N_POLLS1B"); do
+	# shellcheck disable=SC2016
+	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+	khs=$(jq -r '.khs' <<< "$res" 2>/dev/null)
+	nrows=$(jq -r '.stats.hs | length' <<< "$res" 2>/dev/null)
+	if [[ $khs != 16.50 ]] || [[ $nrows != 16 ]]; then
+		n_bad1b=$((n_bad1b+1)); echo "  poll $i: unexpected (khs=$khs rows=$nrows res=$res)"
+	fi
+done
+if (( n_bad1b == 0 )); then
+	ok "per-core regression guard (unloaded): khs=16.50, 16 per-core rows, every poll ($N_POLLS1B polls)"
+else
+	bad "per-core regression guard (unloaded): khs=16.50, 16 per-core rows, every poll" "n_bad=$n_bad1b/$N_POLLS1B"
 fi
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 unset BLOX_PROCFS_ROOT
