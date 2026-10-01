@@ -763,8 +763,46 @@ fi
 kill "$API4D_PID" 2>/dev/null; wait "$API4D_PID" 2>/dev/null
 unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
 
+# ================================================================== case 4e: WATCHDOG overhead on the NORMAL
+# (healthy, instant-reply, no escalation) path - the WATCHDOG adds one extra fork (itself) plus two further,
+# sequential forks of its own (`sleep`, never both alive at once) to EVERY poll, win or lose, not just the
+# escalated ones case 4d/test_hive_scripts.sh's own SIGTERM-ignoring cases already cover - this is the
+# overhead's cost on the common case, where it is pure bookkeeping that should never be visible in the result.
+# Reuses case 4d's own fixture (BLOX_DIR3/PROC3, port 4072, SUM3/BACK3 - instant, no delay/escalation anywhere
+# in this path) for a healthy, fast baseline; 20 polls, each its own fresh `bash -c` process (this file's own
+# established per-poll pattern elsewhere), average AND max reported explicitly so a before/after comparison
+# against a pre-WATCHDOG checkout is just a diff of two log lines, not a re-run with different instrumentation.
+jq -n --argjson s "$SUM3" --argjson b "$BACK3" '{summary: $s, backends: $b}' > "$T/replies4e.json"
+: > "$T/api4e.out"
+python3 "$HERE/fake_xmrig_api.py" 4072 "$T/replies4e.json" > "$T/api4e.out" 2>&1 & API4E_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api4e.out" && break; sleep 0.1; done
+grep -q ready "$T/api4e.out" || bad "WATCHDOG overhead: fake API startup" "$(cat "$T/api4e.out" 2>/dev/null)"
+export BLOX_DIR="$BLOX_DIR3" BLOX_PROCFS_ROOT="$PROC3" BLOX_API_PORT=4072
+N_POLLS4E=20; HARD_CAP4E=3.0
+n_bad4e=0; max4e=0; sum4e=0
+for i in $(seq 1 "$N_POLLS4E"); do
+	t0=$(date +%s.%N)
+	# shellcheck disable=SC2016   # $BLOX_DIR/$khs expand in the inner bash -c, not here
+	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+	t1=$(date +%s.%N)
+	elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b - a}')
+	pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+	awk -v k="${pkhs:-0}" 'BEGIN{exit !(k>0)}' || { n_bad4e=$((n_bad4e+1)); echo "  poll $i: ZERO khs ($res)"; }
+	awk -v e="$elapsed" -v c="$HARD_CAP4E" 'BEGIN{exit !(e > c)}' && { n_bad4e=$((n_bad4e+1)); echo "  poll $i: OVER BUDGET (${elapsed}s)"; }
+	awk -v e="$elapsed" -v m="$max4e" 'BEGIN{exit !(e > m)}' && max4e=$elapsed
+	sum4e=$(awk -v s="$sum4e" -v e="$elapsed" 'BEGIN{printf "%.3f", s + e}')
+done
+avg4e=$(awk -v s="$sum4e" -v n="$N_POLLS4E" 'BEGIN{printf "%.3f", s / n}')
+if (( n_bad4e == 0 )); then
+	ok "WATCHDOG overhead, normal path: $N_POLLS4E polls, avg ${avg4e}s, max ${max4e}s, all khs>0 and < ${HARD_CAP4E}s"
+else
+	bad "WATCHDOG overhead, normal path: $N_POLLS4E polls, all khs>0 and < ${HARD_CAP4E}s" "n_bad=$n_bad4e/$N_POLLS4E avg=${avg4e}s max=${max4e}s"
+fi
+kill "$API4E_PID" 2>/dev/null; wait "$API4E_PID" 2>/dev/null
+unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
+
 leaked=()
-for p in "$API_PID" "$API3_PID" "${API3B_PID:-}" "${API4_PID:-}" "${API4B_PID:-}" "${API4C_PID:-}" "${API4D_PID:-}"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done
+for p in "$API_PID" "$API3_PID" "${API3B_PID:-}" "${API4_PID:-}" "${API4B_PID:-}" "${API4C_PID:-}" "${API4D_PID:-}" "${API4E_PID:-}"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done
 if [[ ${#leaked[@]} -eq 0 ]]; then
 	ok "no leaked fake-API child processes at suite end"
 else

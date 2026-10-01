@@ -738,6 +738,54 @@ pkill -9 -f "$MARKER4" 2>/dev/null
 bloxsense_says "$(fake_topo_json 4)"
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null   # run_hstats_timed never self-cleans like stats_case does
 
+# ---- WATCHDOG boundedness proof: a73c80a's wait_secs() relies ENTIRELY on `read -t` to ever unblock whenever
+# the collector itself is still alive (blocked on a hung bloxsense call, so its own EXIT trap never fires
+# either) - the real, rare CI finding (see h-stats.sh's own WAITFIFO header) was `-t` itself losing its timeout
+# for one single read. BLOX_HSTATS_TEST_NO_TIMEOUT=1 (test-only: h-stats.sh's own wait_secs()) simulates the
+# WORST version of that failure - `-t` not just losing ONE timeout but NEVER firing AT ALL, for the whole poll -
+# without needing to reproduce whatever rare bash/kernel condition causes a real loss. Combined with the same
+# SIGTERM-ignoring bloxsense used above (so the collector is genuinely still alive, never exiting on its own,
+# through both the main poll loop's wait_secs(0.05) calls AND the escalation stage's wait_secs($KILL_GRACE)
+# call), NOTHING would ever unblock either read except the WATCHDOG's own two independent byte-writes - this
+# is the one scenario that isolates the WATCHDOG from the child's own EXIT trap (WAITFIFO's OTHER writer),
+# which never fires here. Must still complete within the 4.0 s hard cap with Phase A's own fresh positive total,
+# the exact same two properties the existing SIGTERM-ignoring-bloxsense+HEALTHY-summary case above already
+# proves for the NORMAL (timeout-working) path.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc; listen 20047 1047 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+MARKER6="bloxminerx_test_no_timeout_bloxsense_$$"
+cat > "$BLOX_DIR/bloxsense" <<EOF
+#!/bin/bash
+trap '' TERM
+exec -a $MARKER6 sleep 30
+EOF
+chmod +x "$BLOX_DIR/bloxsense"
+jq -n --argjson s "$SUM_HEALTHY_5" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20047 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+export BLOX_API_PORT=20047
+rm -f "$BLOX_DIR/.bloxminer-x-hstats-sense"   # see run_hstats_timed's own rationale for clearing this first
+t0=$(date +%s.%N)
+# shellcheck disable=SC2016   # $BLOX_DIR/$khs/$stats are meant to expand inside the inner bash -c, not here
+res=$(BLOX_HSTATS_TEST_NO_TIMEOUT=1 timeout 4.5 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+rc=$?
+t1=$(date +%s.%N)
+elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+sleep 0.5   # let init reap anything that died, before checking for survivors
+survivors6=$(pgrep -f "$MARKER6" || true)
+if [[ $rc == 0 ]] && awk -v e="$elapsed" 'BEGIN{exit !(e < 4.0)}' && \
+   [[ $(jq -r '.khs == "5.00" and (.stats.hs | length) == 1 and .stats.hs[0] == 5' <<< "$res" 2>/dev/null) == true ]] && \
+   [[ -z $survivors6 ]]; then
+	ok "WATCHDOG boundedness: read -t permanently lost + SIGTERM-ignoring bloxsense -> still < 4.0 s, Phase A's positive total survives, no survivors (${elapsed}s)"
+else
+	bad "WATCHDOG boundedness: read -t permanently lost + SIGTERM-ignoring bloxsense -> still < 4.0 s, Phase A's positive total survives, no survivors" \
+		"rc=$rc elapsed=${elapsed}s survivors=[$survivors6] $res"
+fi
+pkill -9 -f "$MARKER6" 2>/dev/null   # safety net: never leak a process into the box even if this test fails
+bloxsense_says "$(fake_topo_json 4)"
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+
 # ---- zombie accumulation: 9a3778a's own fix removed the trailing `wait "$CPID"` outright, reasoning that
 # bash's own job control opportunistically reaps a stale zombie as a side effect of the NEXT poll's own
 # backgrounding - bounding accumulation to at most one pending zombie across repeated polls in the SAME sourced
@@ -748,6 +796,17 @@ kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null   # run_hstats_timed ne
 # contains this test's own marker strings) - to count exactly how many of this shell's own children (zombie or
 # otherwise) are still unreaped, and compares /proc/$$/fd's own entry count before and after to catch any
 # accompanying fd leak (an unreaped child can also mean an unclosed pipe/fd end still held open).
+# WATCHDOG update: this shell now backgrounds TWO children per poll (the collector, $CPID, and the WATCHDOG,
+# $WATCHDOG_PID - see h-stats.sh's own WAITFIFO/WATCHDOG header) instead of one, and neither is explicitly
+# `wait`-ed on (the collector by established design above; the WATCHDOG because it is killed by its own pgid at
+# poll end and the SAME "a zombie here is reclaimed by the next poll's own job-control operations at the
+# latest" reasoning applies to it too - it is just as disposable). The bound below is widened from <= 1 to
+# <= 2 accordingly: at most one lingering zombie PER backgrounded-child type can survive to the next poll under
+# the same opportunistic-reaping argument, never unbounded growth either way. The WATCHDOG's own two `sleep`
+# children are never a SEPARATE leak risk to count here: each is reparented away from this shell (never a
+# child of $$ in the first place - it is the WATCHDOG's own child) the instant the WATCHDOG exits, and the same
+# `kill -9 -- "-$WATCHDOG_PID"` that kills the WATCHDOG targets its WHOLE process group, which still contains
+# any `sleep` still running in it at that instant.
 reset_proc; listen 20037 1037 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 MARKER5="bloxminerx_test_zombie_bloxsense_$$"
 cat > "$BLOX_DIR/bloxsense" <<EOF
@@ -798,10 +857,10 @@ if [[ $children_readable == 0 ]]; then
 	else
 		bad "zombie accumulation: fd count stable (child-count check skipped - /proc/\$\$/task/\$\$/children not readable here)" "raw=[$zres] fd_before=$fd_before fd_after=$fd_after"
 	fi
-elif [[ $nchildren =~ ^[0-9]+$ && $nchildren -le 1 ]] && (( fd_ok )); then
-	ok "zombie accumulation: <= 1 unreaped child after $N_ZPOLLS forced-escalation polls in one sourced shell, fd count stable (children=$nchildren fd $fd_before->$fd_after)"
+elif [[ $nchildren =~ ^[0-9]+$ && $nchildren -le 2 ]] && (( fd_ok )); then
+	ok "zombie accumulation: <= 2 unreaped children (collector + watchdog) after $N_ZPOLLS forced-escalation polls in one sourced shell, fd count stable (children=$nchildren fd $fd_before->$fd_after)"
 else
-	bad "zombie accumulation: <= 1 unreaped child after $N_ZPOLLS forced-escalation polls in one sourced shell, fd count stable" "raw=[$zres] children=$nchildren fd_before=$fd_before fd_after=$fd_after"
+	bad "zombie accumulation: <= 2 unreaped children (collector + watchdog) after $N_ZPOLLS forced-escalation polls in one sourced shell, fd count stable" "raw=[$zres] children=$nchildren fd_before=$fd_before fd_after=$fd_after"
 fi
 pkill -9 -f "$MARKER5" 2>/dev/null
 bloxsense_says "$(fake_topo_json 4)"
