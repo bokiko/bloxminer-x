@@ -559,25 +559,27 @@ unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
 # own API3B server above) - only the API server differs here (a fixed response delay added), everything else
 # about the fixture's shape is the same already-justified "realistic, not artificially heavy" choice made above.
 #
-# DELAY4 is DERIVED, not a guessed/picked constant (a bot-review finding on a sibling package: a fixed ~1.85 s
-# spec failed 20/20 on a slow GitHub runner, because the delay is measured from when the request is SENT, which
-# is AFTER the parent's own start-up work - on a slow/contended vCPU that start-up alone can eat into the
-# budget "by construction", regardless of how generous the post-curl reserve is).
-#   D = budget - (measured start-up x2) - reserve - 0.1s
+# DELAY4 = D, the GUARANTEED-PUBLISH WINDOW under single-CPU saturation - DERIVED, not a guessed/picked constant
+# (a bot-review finding on a sibling package: a fixed ~1.85 s spec failed 20/20 on a slow GitHub runner, because
+# the delay is measured from when the request is SENT, which is AFTER the parent's own start-up work - on a
+# slow/contended vCPU that start-up alone can eat into the budget "by construction", regardless of how generous
+# the post-curl reserve is). A second bot-review round (its own sandbox - slower than GitHub's own runner) found
+# even the x2/0.1s version of this formula too tight once PHASE_A_CURL_RESERVE_US was itself resized - widened
+# to a x4 start-up factor and a 0.2s margin:
+#   D = budget - (measured start-up x4) - reserve - 0.2s
 # "measured start-up" = poll-entry -> summary-request-sent, i.e. EVERYTHING before the mandatory curl is even
 # issued (manifest sourcing, the algo jq parse, the TMPD mktemp -d, writing $LIB, the setsid child's own launch,
 # and the ownership /proc scan inside it) - measured with a standalone harness, taskset -c 0 + saturate_tier(1)
 # (the SAME K=4-oversubscribed single-CPU scenario this case itself runs under), 30 iterations: max 207 ms on
-# ai02. Doubled for margin against start-up itself being slower than this sample happened to catch (not just
-# the common case) - the same reasoning PHASE_A_CURL_RESERVE_US's own measurement uses a safety multiplier for.
-#   D = 2.4 - (0.207 * 2) - 0.3 - 0.1 = 1.586s -> 1.5s (rounded down, matching what the same standalone harness
-# also confirmed reliably survivable under this exact load).
-# Startup cost ITSELF was also cut where cheap this round (bot review's other suggestion): LIB/OUTFILE/HANDSHAKE
-# merged from three mktemp calls into one `mktemp -d`, and PARENT_PGID's own `ps` fork moved to AFTER the child
-# is backgrounded (so it overlaps the child's own work instead of serializing before it) - paired before/after
-# measurement, same harness, same sustained K=4 load: avg start-up 175ms -> 148ms (-15%), max 222ms -> 207ms
-# (-7%, the number D is derived from above).
-DELAY4=1.5
+# ai02 (a figure that has already shown real variance run-to-run under ambient host contention - see
+# PHASE_A_CURL_RESERVE_US's own header for the granular per-phase breakdown this was decomposed into). x4,
+# not x2: margin against start-up being slower than this ONE sample happened to catch on THIS ONE host, given
+# the bot's own sandbox and GitHub's runner have both already shown slower start-up than ai02's own baseline.
+#   D = 2.4 - (0.207 * 4) - 0.1 - 0.2 = 1.272s -> 1.2s (rounded down).
+# reserve = 0.1s: PHASE_A_CURL_RESERVE_US's own new value (see its header) - resized down from 0.3s once the
+# post-curl fork count it has to cover dropped from two to one; this test's own D formula must always track
+# that constant, never assume a value independently of it.
+DELAY4=1.2
 API4_PID=""
 cleanup4() { [[ -n $API4_PID ]] && { kill "$API4_PID" 2>/dev/null; wait "$API4_PID" 2>/dev/null; }; stop_saturating; }
 trap 'cleanup; cleanup3; cleanup4' EXIT

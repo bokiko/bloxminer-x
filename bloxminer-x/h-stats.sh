@@ -88,7 +88,24 @@ __t_us="${__t%%.*}${__t_frac:0:6}"
 DEADLINE_US=$(( __t_us + 2400000 ))   # 2.4 s of the shared 3.0 s budget - see BUDGET_US/KILL_GRACE below
 unset __t __t_frac __t_us
 
+# dbg <msg> - appends a timestamped line to $BLOX_HSTATS_DEBUG_LOG, iff that variable is set (never on a real
+# Hive rig - opt-in only, for a test/CI investigation). A plain `>>` append, no subshell; short-circuits to a
+# single [[ ]] test (no fork at all) when unset, so this can be called freely without a production-path cost.
+# Defined here, as early as possible (right after the one thing - DEADLINE_US - that has to come first) rather
+# than further down, specifically so the PARENT's own pre-launch start-up cost (manifest sourcing, the algo
+# read, temp-file creation) can be timed phase-by-phase too, not just the child's own work - a bot-review
+# finding (CI trace analysis) needed exactly this breakdown to find where the parent's own ~200ms of start-up
+# before the mandatory /2/summary request was actually going.
+# Defined twice (here, for the parent's own pre/post-launch decisions, and again inside LIBEOF below for run()
+# itself, which executes in an isolated child that does not inherit this shell's functions) - not exported,
+# since bash cannot export a function across an exec'd `bash -c` the way it can a plain fork; both copies are
+# kept in lockstep by hand, deliberately tiny, so that is not a maintenance burden.
+dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s x[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }
+export BLOX_HSTATS_DEBUG_LOG   # so the setsid'd child below inherits it too - unset is a no-op either way
+dbg "parent: entry, DEADLINE_US=$DEADLINE_US"
+
 . "${BLOX_DIR:-/hive/miners/custom/bloxminer-x}/h-manifest.conf"   # BLOX_DIR: tests only
+dbg "parent: h-manifest.conf sourced"
 
 PROC=${BLOX_PROCFS_ROOT:-/proc}          # /proc path prefix; tests only
 PKG=${BLOX_DIR:-/hive/miners/custom/bloxminer-x}
@@ -104,6 +121,7 @@ algo=$(jq -r '.pools[0].algo // empty' "$CUSTOM_CONFIG_FILENAME" 2>/dev/null)
 # depend on jq being available - so anything containing a `"` or `\` there would hand back invalid JSON right
 # when a valid, honest answer matters most. A fixed, always-safe default replaces anything that does not match.
 [[ $algo =~ ^rx/[a-z0-9]+$ ]] || algo="rx/0"
+dbg "parent: algo read (jq fork), algo=$algo"
 
 STATEDIR=${BLOX_STATE_DIR:-}
 if [[ -z $STATEDIR ]]; then [[ -d /run/hive ]] && STATEDIR=/run/hive || STATEDIR=$PKG; fi
@@ -122,16 +140,12 @@ export PROC PKG PORT VER algo STATEFILE ENRICHFILE SENSEFILE CUSTOM_LOG_BASENAME
 
 # The whole collection lives in one function library file so the parent's own fallback path (used only when
 # the LIB/OUTFILE/HANDSHAKE temp files themselves cannot be created) and the timed child (the real work) run
-# the exact same code - nothing is duplicated or re-typed.
-# dbg <msg> - appends a timestamped line to $BLOX_HSTATS_DEBUG_LOG, iff that variable is set (never on a real
-# Hive rig - opt-in only, for a test/CI investigation). A plain `>>` append, no subshell; short-circuits to a
-# single [[ ]] test (no fork at all) when unset, so this can be called freely without a production-path cost.
-# Defined twice (here, for the parent's own pre/post-launch decisions, and again inside LIBEOF below for run()
-# itself, which executes in an isolated child that does not inherit this shell's functions) - not exported,
-# since bash cannot export a function across an exec'd `bash -c` the way it can a plain fork; both copies are
-# kept in lockstep by hand, deliberately tiny, so that is not a maintenance burden.
-dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s x[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }
-export BLOX_HSTATS_DEBUG_LOG   # so the setsid'd child below inherits it too - unset is a no-op either way
+# the exact same code - nothing is duplicated or re-typed. (dbg() itself is defined much earlier now, right
+# after DEADLINE_US - see its own header there for why - but the explanation of why it is defined TWICE in this
+# file lives here: again inside LIBEOF below for run() itself, which executes in an isolated child that does
+# not inherit this shell's functions at all - not exported, since bash cannot export a function across an
+# exec'd `bash -c` the way it can a plain fork; both copies are kept in lockstep by hand, deliberately tiny, so
+# that is not a maintenance burden.)
 
 # ONE `mktemp -d` for LIB+OUTFILE+HANDSHAKE together, not three separate mktemp calls - a measured, "cheap to
 # cut" startup-cost fork (bot review: the parent's own start-up work, before the mandatory /2/summary request
@@ -159,6 +173,7 @@ TMPD=$(mktemp -d "${TMPDIR:-/tmp}/bloxminer-x-hstats.XXXXXX") || {
 	printf -v stats '{"hs":[0],"hs_units":"khs","temp":[null],"ar":[0,0],"uptime":0,"ver":"%s","algo":"%s"}' "$VER" "$algo"
 	return 0 2>/dev/null || exit 0
 }
+dbg "parent: TMPD created (mktemp -d)"
 LIB="$TMPD/lib"
 cat > "$LIB" <<'LIBEOF'
 # Budget arithmetic below is pure bash - NO FORK AT ALL (the old design forked `date`+`awk` on every single
@@ -425,13 +440,16 @@ run() {
 	# MEASURED (not assumed): a standalone harness ran this exact merged filter, pinned (taskset -c) to ONE CPU
 	# core that four busy loops (K=4, same oversubscription convention tests/hive/test_under_load.sh now uses)
 	# were ALSO pinned to, 200 iterations - max observed fork+parse+compose cost was 12.0 ms on ai02 (bare metal,
-	# 24 cores; avg 8.0 ms). ai02 has never reproduced the GitHub Actions hard-cap failures this reserve exists
-	# to prevent (GH's shared/throttled runners are demonstrably worse - see the CI trace instrumentation added
-	# for that failure), so this is not the raw measurement alone: it is that measurement with a documented,
-	# wide (~25x) safety multiplier, landing at the same 0.3 s this reserve already used - not a smaller number
-	# chosen to match the gentler of the two known environments, but the SAME number now justified by an actual
-	# load test covering HALF as many forks as before, rather than an unmeasured guess covering twice as many.
-	PHASE_A_CURL_RESERVE_US=300000
+	# 24 cores; avg 8.0 ms).
+	#
+	# A THIRD P1 finding (bot review, its own sandbox - slower than GitHub's own runner): the 0.3 s this reserve
+	# still used was itself too generous once the fork count it has to cover was halved - starving the mandatory
+	# curl of 300 ms it did not need, on exactly the slow/contended host where every millisecond of curl's own
+	# window matters most. Resized to 100 ms: ~8x the single measured max above (12.0 ms), the same kind of
+	# documented safety multiplier this file already uses elsewhere (not a number chosen to exactly match
+	# ai02's own gentler measurement), but now sized for ONE fork instead of the TWO the old 0.3 s was covering
+	# when it was first picked. Gives the mandatory /2/summary curl 200 ms more of the shared budget.
+	PHASE_A_CURL_RESERVE_US=100000
 	curl_budget_us=$(( REPLY - PHASE_A_CURL_RESERVE_US )); (( curl_budget_us < 50000 )) && curl_budget_us=50000
 	us_to_secstr "$curl_budget_us"
 	sum=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/summary" 2>/dev/null); curl_rc=$?
@@ -803,6 +821,7 @@ run() {
 }
 LIBEOF
 
+dbg "parent: LIB written (cat heredoc)"
 # shellcheck disable=SC1090   # $LIB is a script this file just generated into a temp file, not a fixed path
 . "$LIB"   # the parent also gets fallback()/note_state()/write_result() from here, for the LIB-creation-failure path
 
