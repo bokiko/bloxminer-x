@@ -1027,10 +1027,16 @@ rm -f "$BLOX_DIR/.bloxminer-x-hstats-enrich"
 # file has no such path (grep: .version is only ever type-checked, "is this a real XMRig reply", then
 # discarded - never extracted into output; $VER is this package's own fixed CUSTOM_VERSION constant, $algo is
 # already regex-validated before ANY hand-built-JSON use - see fallback()'s own header), but a fake API
-# returning that exact adversarial version string is a permanent, cheap regression test rather than trusting a
-# one-time code read.
+# returning that exact adversarial version string (AND an adversarial .algo, even though this file's own $algo
+# never comes from the API at all - see the separate config.json test right after this one for the path that
+# DOES matter) is a permanent, cheap regression test rather than trusting a one-time code read. Also checked
+# every printf/printf -v call in h-stats.sh directly (not just this one call site): every single one passes a
+# FIXED, literal format string as its own first argument, with all variable/external data passed as separate
+# %s/%04X/%.2f ARGUMENTS - never concatenated into the format text itself (the other bug class a sibling
+# package hit: external data landing IN a printf format string, not just an argument, lets a `%` sequence in
+# that data reinterpret subsequent arguments). No such site exists in this file.
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
-SUM_VER_ESCAPE=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0\"\\x", hashrate: {total: [2006.0]}}')
+SUM_VER_ESCAPE=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0\"evil", version: "6.26.0\"\\x", hashrate: {total: [2006.0]}}')
 reset_proc; listen 20044 1044 "$BLOX_DIR/xmrig"
 jq -n --argjson s "$SUM_VER_ESCAPE" --argjson b null '{summary: $s, backends: $b}' > "$T/replies.json"
 : > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20044 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
@@ -1038,14 +1044,37 @@ for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 n_bad_ver=0
 for _ in 1 2 3; do
 	res=$(BLOX_API_PORT=20044 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
-	jq -e . > /dev/null 2>&1 <<< "$res" || n_bad_ver=$((n_bad_ver+1))
+	if [[ $(jq -r '(. | type == "object") and (.khs | tonumber) > 0' <<< "$res" 2>/dev/null) != true ]]; then
+		n_bad_ver=$((n_bad_ver+1))
+	fi
 done
 if (( n_bad_ver == 0 )); then
-	ok "JSON escaping: API version containing a quote+backslash -> still valid JSON every poll"
+	ok "JSON escaping: API version+algo containing a quote+backslash -> still valid JSON, khs>0, every poll"
 else
-	bad "JSON escaping: API version containing a quote+backslash -> still valid JSON every poll" "n_bad=$n_bad_ver last=$res"
+	bad "JSON escaping: API version+algo containing a quote+backslash -> still valid JSON, khs>0, every poll" "n_bad=$n_bad_ver last=$res"
 fi
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+
+# ---- the path that DOES matter: this file's own $algo comes from $CUSTOM_CONFIG_FILENAME (config.json), never
+# from the live API - a hand-edited/corrupted config.json is the only realistic way a malicious algo string
+# could exist at all (h-config.sh's own ALGOS allow-list rejects anything else on the normal write path - see
+# its own tests above). h-stats.sh's regex gate (^rx/[a-z0-9]+$, see its own assignment near the top of the
+# file) must force a quote-carrying algo back to the safe "rx/0" default before it ever reaches any hand-built
+# JSON, independent of whether the API side is also hostile.
+jq -n '{pools: [{algo: "rx/0\"evil"}]}' > "$CONF"
+reset_proc; listen 20045 1045 "$BLOX_DIR/xmrig"
+SUM_ALGO_OK=$(jq -nc '{uptime: 1, connection: {accepted: 0, rejected: 0}, algo: "rx/0", version: "6.26.0"}')
+jq -n --argjson s "$SUM_ALGO_OK" --argjson b null '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20045 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+res=$(BLOX_API_PORT=20045 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+if jq -e . > /dev/null 2>&1 <<< "$res" && [[ $(jq -r '.stats.algo' <<< "$res" 2>/dev/null) == "rx/0" ]]; then
+	ok "config.json algo with a quote -> rejected by the regex gate, falls back to rx/0, valid JSON"
+else
+	bad "config.json algo with a quote -> rejected by the regex gate, falls back to rx/0, valid JSON" "$res"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+jq -n '{pools: [{algo: "rx/0"}]}' > "$CONF"   # restore - later tests in this file expect the normal config
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
