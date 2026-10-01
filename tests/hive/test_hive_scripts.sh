@@ -565,6 +565,39 @@ fi
 pkill -9 -f "$MARKER1" 2>/dev/null   # safety net: never leak a process into the box even if this test fails
 bloxsense_says "$(fake_topo_json 4)"
 
+# ---- CI finding regression test: the same SIGTERM-ignoring bloxsense (forcing REAL escalation through to
+# SIGKILL, not just a TERM that worked) but with a HEALTHY, POSITIVE /2/summary this time - Phase A's own
+# fresh total must survive the full escalation path and be returned promptly, never a false 0, even though the
+# escalation itself (TERM, grace, KILL) has to run its full course because this bloxsense never responds to
+# TERM. This is the exact property a real CI run (GitHub Actions, un-throttled ai02 never reproduced it) once
+# measured failing: a 5.01 s poll (hard cap 4.0 s) that returned a false/empty result - traced to a blocking,
+# untimed `wait "$CPID"` sitting between the result already being safely written and this file ever reading it
+# back (see h-stats.sh's own comment at that exact point for the fix and the full explanation).
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc; listen 20036 1036 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+MARKER4="bloxminerx_test_survivor_bloxsense2_healthy_$$"
+cat > "$BLOX_DIR/bloxsense" <<EOF
+#!/bin/bash
+trap '' TERM
+exec -a $MARKER4 sleep 30
+EOF
+chmod +x "$BLOX_DIR/bloxsense"
+jq -n --argjson s "$SUM_HEALTHY_5" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20036 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+export BLOX_API_PORT=20036
+run_hstats_timed
+sleep 0.5
+survivors4=$(pgrep -f "$MARKER4" || true)
+if awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' && [[ $(jq -r '.khs == "5.00" and (.stats.hs | length) == 1 and .stats.hs[0] == 5' <<< "$res" 2>/dev/null) == true ]] && [[ -z $survivors4 ]]; then
+	ok "SIGTERM-ignoring bloxsense + HEALTHY summary: Phase A's fresh positive total survives escalation, < 3.0 s (${elapsed}s)"
+else
+	bad "SIGTERM-ignoring bloxsense + HEALTHY summary: Phase A's fresh positive total survives escalation, < 3.0 s" "elapsed=${elapsed}s survivors=[$survivors4] $res"
+fi
+pkill -9 -f "$MARKER4" 2>/dev/null
+bloxsense_says "$(fake_topo_json 4)"
+
 # ---- a `curl` that TRAPS/IGNORES SIGTERM and sleeps indefinitely (simulating a stuck/adversarial API call,
 #      invoked directly with no nested timeout of its own) must also be reachable by the same outer kill
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null

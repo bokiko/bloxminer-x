@@ -696,11 +696,33 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		escalate TERM
 		wait_secs "$waitfd" "$KILL_GRACE"
 		still_running && escalate KILL
-		wait "$CPID" 2>/dev/null   # $CPID was still unreaped here - reap it
 	fi
 	(( waitfd >= 0 )) && { exec {waitfd}<&-; } 2>/dev/null
+	# CI finding (GH Actions, un-throttled ai02 never reproduced it): the read-back used to happen AFTER a
+	# BLOCKING, UNTIMED `wait "$CPID"` right here - SIGKILL kills its target immediately regardless of OUR own
+	# scheduling, but `wait` only returns once THIS shell has itself been scheduled long enough to receive and
+	# process the resulting SIGCHLD; under exactly the severe CPU starvation this escalation path exists to
+	# recover from, that bookkeeping step can itself be delayed well past this file's own nominal 2.4 s/2.7 s
+	# budget, with nothing bounding it - one real CI run measured a 5.01 s poll (hard cap 4.0 s) that returned a
+	# false/empty result, the external `timeout` around the whole poll killing everything before this file ever
+	# reached its own result read-back. $OUTFILE is read HERE, before the reap, specifically so an
+	# already-safely-written answer (at minimum Phase A's own fresh total - see write_result's own atomic
+	# tmp+rename and the file header's Phase A/B design) is never held hostage by how long reaping $CPID takes.
 	result=$(cat "$OUTFILE" 2>/dev/null)
 	rm -f "$OUTFILE" "$HANDSHAKE"
+	# No explicit `wait "$CPID"` at all, deliberately: SIGKILL has already terminated $CPID by this point
+	# (unblockable, immediate, regardless of this shell's own scheduling) - what a trailing `wait` here would
+	# actually be doing is REAPING it (clearing the zombie), a bookkeeping step with no bearing on the answer
+	# already captured above, and the exact thing measured to itself block arbitrarily long under the CPU
+	# starvation this escalation path exists to survive (see this function's own CI-reproduced finding).
+	# Skipping it outright is safe, not just expedient: Hive sources this file repeatedly in the SAME long-
+	# lived agent shell (see this package's own "repeated polls in one sourced shell" test) - bash's own job
+	# control opportunistically reaps previously-terminated background jobs as a side effect of the NEXT
+	# `&`/`wait`/job-status operation (this function backgrounds a fresh child every single poll), so a zombie
+	# left here is reclaimed on the very next poll at the latest, never accumulating unbounded - and even if it
+	# somehow never were, the kernel reparents and reaps any still-pending zombie the moment this process's own
+	# parent (Hive's agent, or whatever sourced this file) eventually exits. Trading a worst-case INDEFINITE
+	# hang for, at most, one transient zombie entry between polls is the right side of that trade.
 else
 	result=""
 fi
