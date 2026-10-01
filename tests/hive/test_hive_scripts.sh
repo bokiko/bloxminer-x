@@ -380,6 +380,12 @@ reset_proc; listen 20033 1033 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t
 bloxsense_says "$(fake_topo_json 4)"
 stats_case "healthy summary (50 kH/s) + complete but wildly disagreeing backends (7 kH/s) -> Phase A's total stands" \
 	20033 "$SUM_HEALTHY_50" "$BACK_SOME_REAL" '.khs == "50.00" and (.stats.hs | length) == 1 and .stats.hs[0] == 50'
+# stats_case's own cleanup-on-NEXT-call convention (kill "$API_PID" at its own entry) only fires when the NEXT
+# step is ALSO a stats_case call - the next one below is a raw block instead, which never calls stats_case
+# again, so this server would otherwise leak for the rest of the script (silently - different ports never
+# collide, only ever noticed as a stray listener outliving this whole test run). Explicit here so every port
+# gets torn down before the next one starts, never relying on what kind of step comes next.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 
 # ---- failed stats composition: BLOX_HSTATS_TEST_FORCE_STATS_FAIL simulates the transient jq/fork failure
 # class the composition's own validate-before-write guard exists for (see run()'s own header comment) - makes
@@ -596,6 +602,58 @@ else
 	bad "SIGTERM-ignoring bloxsense + HEALTHY summary: Phase A's fresh positive total survives escalation, < 3.0 s" "elapsed=${elapsed}s survivors=[$survivors4] $res"
 fi
 pkill -9 -f "$MARKER4" 2>/dev/null
+bloxsense_says "$(fake_topo_json 4)"
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null   # run_hstats_timed never self-cleans like stats_case does
+
+# ---- zombie accumulation: 9a3778a's own fix removed the trailing `wait "$CPID"` outright, reasoning that
+# bash's own job control opportunistically reaps a stale zombie as a side effect of the NEXT poll's own
+# backgrounding - bounding accumulation to at most one pending zombie across repeated polls in the SAME sourced
+# shell (the real Hive agent's own pattern), never unbounded growth. That claim needs a test, not just an
+# argument: sources h-stats.sh N times in ONE shell, where EVERY poll is forced through the full TERM-then-KILL
+# escalation path (the same SIGTERM-ignoring bloxsense as above), then reads /proc/$$/task/$$/children -
+# a BUILTIN-only read (`cat` is the one fork; pgrep/ps would self-match their own invocation's cmdline, which
+# contains this test's own marker strings) - to count exactly how many of this shell's own children (zombie or
+# otherwise) are still unreaped, and compares /proc/$$/fd's own entry count before and after to catch any
+# accompanying fd leak (an unreaped child can also mean an unclosed pipe/fd end still held open).
+reset_proc; listen 20037 1037 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+MARKER5="bloxminerx_test_zombie_bloxsense_$$"
+cat > "$BLOX_DIR/bloxsense" <<EOF
+#!/bin/bash
+trap '' TERM
+exec -a $MARKER5 sleep 30
+EOF
+chmod +x "$BLOX_DIR/bloxsense"
+jq -n --argjson s "$SUM_HEALTHY_5" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20037 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+
+N_ZPOLLS=5
+# shellcheck disable=SC2016   # $BLOX_DIR/$$ are meant to expand inside the inner bash -c, not here
+zres=$(BLOX_DIR=$BLOX_DIR BLOX_PROCFS_ROOT=$PROC BLOX_API_PORT=20037 bash -c '
+	fd_before=$(ls /proc/$$/fd 2>/dev/null | wc -l)
+	for i in $(seq 1 '"$N_ZPOLLS"'); do
+		. "$BLOX_DIR/h-stats.sh"
+	done
+	children=$(cat /proc/$$/task/$$/children 2>/dev/null)
+	fd_after=$(ls /proc/$$/fd 2>/dev/null | wc -l)
+	echo "children=[$children] fd_before=$fd_before fd_after=$fd_after"
+')
+nchildren=$(sed -n 's/.*children=\[\(.*\)\] fd_before.*/\1/p' <<< "$zres" | wc -w | tr -d '[:space:]')
+fd_before=$(sed -n 's/.*fd_before=\([0-9]*\).*/\1/p' <<< "$zres")
+fd_after=$(sed -n 's/.*fd_after=\([0-9]*\).*/\1/p' <<< "$zres")
+# fd count: a generous +2 tolerance (never a hard equality) - the ONE bookkeeping `ls`/`wc` pair itself can
+# transiently differ by a file descriptor or two depending on exactly when bash's own internal housekeeping
+# runs, with no bearing on whether a REAL per-poll fd leak exists (that would grow roughly linearly with
+# N_ZPOLLS=5, not stay within a small constant).
+if [[ $nchildren =~ ^[0-9]+$ && $nchildren -le 1 ]] && [[ $fd_before =~ ^[0-9]+$ && $fd_after =~ ^[0-9]+$ ]] \
+	&& (( fd_after <= fd_before + 2 ))
+then
+	ok "zombie accumulation: <= 1 unreaped child after $N_ZPOLLS forced-escalation polls in one sourced shell, fd count stable (children=$nchildren fd $fd_before->$fd_after)"
+else
+	bad "zombie accumulation: <= 1 unreaped child after $N_ZPOLLS forced-escalation polls in one sourced shell, fd count stable" "raw=[$zres] children=$nchildren fd_before=$fd_before fd_after=$fd_after"
+fi
+pkill -9 -f "$MARKER5" 2>/dev/null
 bloxsense_says "$(fake_topo_json 4)"
 
 # ---- a `curl` that TRAPS/IGNORES SIGTERM and sleeps indefinitely (simulating a stuck/adversarial API call,
