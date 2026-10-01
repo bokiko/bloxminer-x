@@ -62,6 +62,48 @@ stop_saturating() {   # shared by saturate_cpus() and saturate_tier() - both fil
 	BUSY_PIDS=()
 }
 
+# AVAIL_CPUS: this process's OWN current CPU affinity, expanded from /proc/self/status's Cpus_allowed_list (a
+# range-list like "2-4,7"), NOT assumed to be "0..nproc-1" - a bot-review finding (sibling package): every
+# `taskset -c "0-$hi"`/`taskset -c 0` in this file used to build its CPU IDs from a literal 0 upward, which
+# breaks outright if THIS SUITE ITSELF is invoked under a restricted affinity (e.g. `taskset -c 2-4 bash
+# tests/hive/test_under_load.sh`, the exact scenario this fix is verified under) - CPU 0 may not even be in the
+# set this process is permitted to run on, and `taskset -c 0 ...` then fails to pin anything at all rather than
+# testing a real 1-CPU tier. Computed once, up front - this process's own affinity does not change mid-run.
+AVAIL_CPUS=()
+available_cpus() {
+	AVAIL_CPUS=()
+	local line list part lo hi parts
+	line=$(grep '^Cpus_allowed_list:' /proc/self/status 2>/dev/null)
+	list=${line#Cpus_allowed_list:}
+	list=${list//[[:space:]]/}
+	if [[ -z $list ]]; then
+		# No /proc/self/status (non-Linux test host) - fall back to assuming the full 0..nproc-1 range, the
+		# previous behavior, rather than leaving AVAIL_CPUS empty and skipping every tier unnecessarily.
+		local n; n=$(nproc)
+		for ((c = 0; c < n; c++)); do AVAIL_CPUS+=("$c"); done
+		return
+	fi
+	IFS=',' read -ra parts <<< "$list"
+	for part in "${parts[@]}"; do
+		if [[ $part == *-* ]]; then
+			lo=${part%-*}; hi=${part#*-}
+			for ((c = lo; c <= hi; c++)); do AVAIL_CPUS+=("$c"); done
+		else
+			AVAIL_CPUS+=("$part")
+		fi
+	done
+}
+available_cpus
+first_n_cpus() {   # $1 = how many CPU IDs are needed; on success sets $REPLY to a comma-joined `taskset -c`
+	# argument built from the FIRST $1 entries of $AVAIL_CPUS (this process's own real affinity, never a
+	# literal 0..$1-1 guess) - returns 1, REPLY empty, if fewer than $1 CPUs are available to this process at
+	# all; callers SKIP that tier with a message in that case rather than silently pinning to the wrong CPUs.
+	REPLY=""
+	(( ${#AVAIL_CPUS[@]} >= $1 )) || return 1
+	local IFS=','
+	REPLY="${AVAIL_CPUS[*]:0:$1}"
+}
+
 # ================================================================== case 1: fake /proc (~1500 fds/375 procs), full CPU load
 BLOX_DIR="$T/pkg"; mkdir -p "$BLOX_DIR" "$T/log"
 cp "$PKGSRC"/h-config.sh "$PKGSRC"/h-stats.sh "$BLOX_DIR"/
@@ -430,11 +472,13 @@ for _ in $(seq 20); do curl -fsS --max-time 1 -o /dev/null "http://127.0.0.1:407
 export BLOX_DIR="$BLOX_DIR3" BLOX_PROCFS_ROOT="$PROC3" BLOX_API_PORT=4072
 
 if command -v taskset > /dev/null 2>&1; then
-	NPROC=$(nproc)
 	DISP_N=5
 	for want in 1 2 3; do
-		(( want <= NPROC )) || continue
-		hi=$((want - 1))
+		if ! first_n_cpus "$want"; then
+			echo "SKIP: taskset tier $want CPU(s) - only ${#AVAIL_CPUS[@]} CPU(s) available to this process"
+			continue
+		fi
+		cpulist=$REPLY
 		eb=1; (( want < 3 )) && eb=0   # budget enforced from 3 CPUs up only - 1-2 CPU tiers are a pure liveness
 			# check (no false zeros, no hard-cap overrun), no timing claim - the same policy BloxMiner v3's own
 			# load tests use, since scheduling jitter at the most extreme tiers is not a real regression signal.
@@ -444,7 +488,7 @@ if command -v taskset > /dev/null 2>&1; then
 		for _ in $(seq 1 "$DISP_N"); do
 			t0=$(date +%s.%N)
 			# shellcheck disable=SC2016
-			res=$(timeout 5 taskset -c "0-$hi" bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+			res=$(timeout 5 taskset -c "$cpulist" bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
 			t1=$(date +%s.%N)
 			elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
 			pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
@@ -456,9 +500,9 @@ if command -v taskset > /dev/null 2>&1; then
 		stop_saturating
 		n_ok_d=$((DISP_N - n_over_d)); n_need_d=$(( (DISP_N * 9 + 9) / 10 ))
 		if [[ $n_zero_d == 0 && $n_hardfail_d == 0 ]] && (( ! eb || n_ok_d >= n_need_d )); then
-			ok "h-stats.sh, taskset 0-$hi ($want CPU(s)): no false zeros$( ((eb)) && echo ", $n_ok_d/$DISP_N < 3.5s (need >= $n_need_d/$DISP_N)" ) (max ${max_d}s)"
+			ok "h-stats.sh, taskset $cpulist ($want CPU(s)): no false zeros$( ((eb)) && echo ", $n_ok_d/$DISP_N < 3.5s (need >= $n_need_d/$DISP_N)" ) (max ${max_d}s)"
 		else
-			bad "h-stats.sh, taskset 0-$hi ($want CPU(s)): no false zeros$( ((eb)) && echo ", $n_ok_d/$DISP_N under budget (need >= $n_need_d/$DISP_N), 0 hard-cap failures" )" \
+			bad "h-stats.sh, taskset $cpulist ($want CPU(s)): no false zeros$( ((eb)) && echo ", $n_ok_d/$DISP_N under budget (need >= $n_need_d/$DISP_N), 0 hard-cap failures" )" \
 				"n_zero=$n_zero_d n_over=$n_over_d n_hardfail=$n_hardfail_d max=${max_d}s"
 		fi
 	done
@@ -510,15 +554,16 @@ python3 "$HERE/fake_xmrig_api.py" 4072 "$T/replies4.json" > "$T/api4.out" 2>&1 &
 for _ in $(seq 50); do grep -q ready "$T/api4.out" && break; sleep 0.1; done
 grep -q ready "$T/api4.out" || bad "Phase A late-summary: fake API startup" "$(cat "$T/api4.out" 2>/dev/null)"
 export BLOX_DIR="$BLOX_DIR3" BLOX_PROCFS_ROOT="$PROC3" BLOX_API_PORT=4072
-if command -v taskset > /dev/null 2>&1; then
-	saturate_tier 1; sleep 0.3   # 1-CPU tier (taskset -c 0 below) - K=4 busy loops, not nproc, see saturate_tier()
+if command -v taskset > /dev/null 2>&1 && first_n_cpus 1; then
+	cpu0=$REPLY
+	saturate_tier 1; sleep 0.3   # 1-CPU tier (taskset -c $cpu0 below) - K=4 busy loops, not nproc, see saturate_tier()
 	N_POLLS4=20; HARD_CAP4=4.0
 	n_zero4=0; n_hardfail4=0; max4=0
 	for i in $(seq 1 "$N_POLLS4"); do
 		DBGLOG4="$T/dbg4_$i.log"; rm -f "$DBGLOG4"
 		t0=$(date +%s.%N)
 		# shellcheck disable=SC2016   # $BLOX_DIR/$khs expand in the inner bash -c, not here
-		res=$(BLOX_HSTATS_DEBUG_LOG="$DBGLOG4" timeout 5 taskset -c 0 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+		res=$(BLOX_HSTATS_DEBUG_LOG="$DBGLOG4" timeout 5 taskset -c "$cpu0" bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
 		t1=$(date +%s.%N)
 		elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
 		pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
@@ -534,13 +579,13 @@ if command -v taskset > /dev/null 2>&1; then
 	done
 	stop_saturating
 	if [[ $n_zero4 == 0 && $n_hardfail4 == 0 ]]; then
-		ok "Phase A cheap-publish: summary delayed ${DELAY4}s, pinned+saturated CPU 0, $N_POLLS4 polls -> khs>0 every poll, max ${max4}s"
+		ok "Phase A cheap-publish: summary delayed ${DELAY4}s, pinned+saturated CPU $cpu0, $N_POLLS4 polls -> khs>0 every poll, max ${max4}s"
 	else
-		bad "Phase A cheap-publish: summary delayed ${DELAY4}s, pinned+saturated CPU 0, $N_POLLS4 polls -> khs>0 every poll" \
+		bad "Phase A cheap-publish: summary delayed ${DELAY4}s, pinned+saturated CPU $cpu0, $N_POLLS4 polls -> khs>0 every poll" \
 			"n_zero=$n_zero4 n_hardfail=$n_hardfail4 max=${max4}s"
 	fi
 else
-	echo "SKIP: taskset not available - Phase A late-summary case skipped"
+	echo "SKIP: taskset unavailable or no CPU available to this process - Phase A late-summary case skipped"
 fi
 kill "$API4_PID" 2>/dev/null; wait "$API4_PID" 2>/dev/null
 unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
@@ -562,14 +607,15 @@ grep -q ready "$T/api4b.out" || bad "Phase A delay > budget: fake API startup" "
 # file) hardcodes that single listening port - case 4's own API server was already killed before this one
 # starts, so reusing it here is safe and avoids yet another fixture rebuild for no benefit.
 export BLOX_DIR="$BLOX_DIR3" BLOX_PROCFS_ROOT="$PROC3" BLOX_API_PORT=4072
-if command -v taskset > /dev/null 2>&1; then
+if command -v taskset > /dev/null 2>&1 && first_n_cpus 1; then
+	cpu0=$REPLY
 	saturate_tier 1; sleep 0.3
 	N_POLLS4B=5; HARD_CAP4B=4.0
 	n_bad4b=0; max4b=0
 	for i in $(seq 1 "$N_POLLS4B"); do
 		t0=$(date +%s.%N)
 		# shellcheck disable=SC2016   # $BLOX_DIR/$khs expand in the inner bash -c, not here
-		res=$(timeout 5 taskset -c 0 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+		res=$(timeout 5 taskset -c "$cpu0" bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
 		t1=$(date +%s.%N)
 		elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
 		pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
@@ -587,7 +633,7 @@ if command -v taskset > /dev/null 2>&1; then
 		bad "Phase A: summary delayed ${DELAY4B}s (past the whole budget) -> bounded honest 0" "n_bad=$n_bad4b max=${max4b}s"
 	fi
 else
-	echo "SKIP: taskset not available - Phase A delay>budget case skipped"
+	echo "SKIP: taskset unavailable or no CPU available to this process - Phase A delay>budget case skipped"
 fi
 kill "$API4B_PID" 2>/dev/null; wait "$API4B_PID" 2>/dev/null
 unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
@@ -610,13 +656,14 @@ python3 "$HERE/fake_xmrig_api.py" 4072 "$T/replies4c.json" > "$T/api4c.out" 2>&1
 for _ in $(seq 50); do grep -q ready "$T/api4c.out" && break; sleep 0.1; done
 grep -q ready "$T/api4c.out" || bad "startup case: fake API startup" "$(cat "$T/api4c.out" 2>/dev/null)"
 export BLOX_DIR="$BLOX_DIR3" BLOX_PROCFS_ROOT="$PROC3" BLOX_API_PORT=4072   # same port 4072 - see case 4b's own comment above
-if command -v taskset > /dev/null 2>&1; then
+if command -v taskset > /dev/null 2>&1 && first_n_cpus 1; then
+	cpu0=$REPLY
 	saturate_tier 1; sleep 0.3
 	N_POLLS4C=5
 	n_bad4c=0
 	for i in $(seq 1 "$N_POLLS4C"); do
 		# shellcheck disable=SC2016   # $BLOX_DIR/$khs expand in the inner bash -c, not here
-		res=$(timeout 5 taskset -c 0 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+		res=$(timeout 5 taskset -c "$cpu0" bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
 		pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
 		[[ $pkhs == 0.00 ]] || { n_bad4c=$((n_bad4c+1)); echo "  poll $i: unexpected ($res)"; }
 	done
@@ -627,7 +674,7 @@ if command -v taskset > /dev/null 2>&1; then
 		bad "startup case: summary total null, threads null -> honest Phase A 0.00, not a false zero" "n_bad=$n_bad4c"
 	fi
 else
-	echo "SKIP: taskset not available - startup case skipped"
+	echo "SKIP: taskset unavailable or no CPU available to this process - startup case skipped"
 fi
 kill "$API4C_PID" 2>/dev/null; wait "$API4C_PID" 2>/dev/null
 unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
