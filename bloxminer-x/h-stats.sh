@@ -127,8 +127,17 @@ export PROC PKG PORT VER algo STATEFILE ENRICHFILE CUSTOM_LOG_BASENAME
 dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s x[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }
 export BLOX_HSTATS_DEBUG_LOG   # so the setsid'd child below inherits it too - unset is a no-op either way
 
-LIB=$(mktemp "${TMPDIR:-/tmp}/bloxminer-x-hstats-lib.XXXXXX") || {
-	dbg "LIB mktemp FAILED - emergency fallback, no fork"
+# ONE `mktemp -d` for LIB+OUTFILE+HANDSHAKE together, not three separate mktemp calls - a measured, "cheap to
+# cut" startup-cost fork (bot review: the parent's own start-up work, before the mandatory /2/summary request
+# is even sent, is what a too-tight PHASE_A_CURL_RESERVE_US actually has to survive). Also a real simplification,
+# not just a speedup: the OLD design's three independent mktemp calls could partially fail (OUTFILE succeeds,
+# HANDSHAKE does not, or vice versa - the P2 bot-review fix this replaces), needing its own careful "clean up
+# whichever one DID succeed" handling; a single directory allocation is atomic - it either exists, with every
+# path inside it automatically valid, or it does not and the block below already bailed out before anything
+# else ran. LIB/OUTFILE/HANDSHAKE are plain, unmktemp'd paths inside it: safe without their own mktemp, since
+# $TMPD's own name is already the unique, unpredictable, exclusively-owned part.
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/bloxminer-x-hstats.XXXXXX") || {
+	dbg "TMPD mktemp FAILED - emergency fallback, no fork"
 	# printf -v, not stats=$(printf ...): a command substitution forks a subshell regardless of the command run
 	# inside it being a builtin - and this whole block exists BECAUSE mktemp (a fork) just failed, i.e. exactly
 	# the resource-pressure state a further fork here could fail in too, leaving $stats empty rather than this
@@ -137,6 +146,7 @@ LIB=$(mktemp "${TMPDIR:-/tmp}/bloxminer-x-hstats-lib.XXXXXX") || {
 	printf -v stats '{"hs":[0],"hs_units":"khs","temp":[null],"ar":[0,0],"uptime":0,"ver":"%s","algo":"%s"}' "$VER" "$algo"
 	return 0 2>/dev/null || exit 0
 }
+LIB="$TMPD/lib"
 cat > "$LIB" <<'LIBEOF'
 # Budget arithmetic below is pure bash - NO FORK AT ALL (the old design forked `date`+`awk` on every single
 # check). Real-Hive evidence: on a saturated rig, every fork here is scheduling latency spent finding out how
@@ -302,6 +312,7 @@ valid_backends() {
 run() {
 	local port_hex inode owner_pid owned fd_dir sum uptime acc rej khs_fresh pidstart enrich_temp
 	local back threads naff sense pkg_temp power_raw percore task_set api_set rows
+	local parsed_back gate_out gate_ok rows_out hs_json temp_json
 	local exe_link curl_rc PHASE_A_CURL_RESERVE_US curl_budget_us
 
 	remaining_us; dbg "run() entry: remaining_us=$REPLY"
@@ -453,16 +464,30 @@ run() {
 	cap_us "$REPLY" 500000; us_to_secstr "$REPLY"
 	back=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/backends" 2>/dev/null); curl_rc=$?
 	dbg "phase B: curl --max-time $REPLY /2/backends rc=$curl_rc len=${#back} body=${back:0:300}"
-	# `[[ -n $back ]] &&` first - see valid_summary()/valid_backends()'s own header for the full rationale
-	# (jq 1.6's `-e` exits 0, "successful", on EMPTY input - an empty $back, e.g. a curl timeout/connection-
-	# refused, used to pass this check on jq 1.6 and reach the per-thread parsing below instead of the
-	# intended SKIP; downstream naff==0 happened to still catch it safely, but only by accident, and with the
-	# wrong diagnostic message).
-	{ [[ -n $back ]] && jq -e . > /dev/null 2>&1 <<< "$back" && valid_backends "$back"; } || { dbg "phase B: SKIPPED - backends reply not valid JSON/shape, Phase A's khs=$khs stands"; note_state shallow; return 0; }
-
-	threads=$(jq -c '[.[] | select(.type == "cpu") | .threads[]?] // []' <<< "$back" 2>/dev/null)
+	# ONE jq call does validate-shape + thread-extraction + naff together - a CI-trace-measured cost center
+	# (bot review, GH 2-vCPU runner: "naff jq 0.30s") used to be FOUR separate forks: a generic "is this JSON at
+	# all" probe, valid_backends()'s own schema check, extracting $threads, and counting it into $naff. `jq -r`
+	# (not `-e`) on $back directly subsumes all of that: the `if` guard below IS the exact same schema
+	# valid_backends() checks (kept as its own function too, for any caller that wants just the boolean), and a
+	# non-matching or truly empty/non-JSON $back simply produces no output either way - no jq-1.6-vs-1.7 `-e`
+	# divergence to account for here, since that divergence is specifically about `-e`'s treatment of a falsy/
+	# absent LAST value, and this filter never uses `-e`. `[[ -n $back ]] &&` first regardless, consistent with
+	# every other jq call in this file, and cheap insurance against even attempting a fork on an empty string.
+	parsed_back=""
+	[[ -n $back ]] && parsed_back=$(jq -r '
+		if (type == "array") and
+		   (map(select(.type == "cpu")) as $c | ($c | length) <= 1 and
+		    ($c | all(.threads == null or (
+		      (.threads | type) == "array" and
+		      (.threads | all(type == "object" and (.affinity | type == "number") and (.hashrate | type == "array")))
+		    ))))
+		then ([.[] | select(.type == "cpu") | .threads[]?] // []) as $th | [($th | length), ($th | tojson)] | @tsv
+		else empty end
+	' <<< "$back" 2>/dev/null)
+	if [[ -z $parsed_back ]]; then dbg "phase B: SKIPPED - backends reply not valid JSON/shape, Phase A's khs=$khs stands"; note_state shallow; return 0; fi
+	IFS=$'\t' read -r naff threads <<< "$parsed_back"
+	int "$naff" || naff=0
 	[[ -n $threads ]] || threads='[]'
-	naff=$(jq 'length' <<< "$threads" 2>/dev/null); int "$naff" || naff=0
 	dbg "phase B: naff=$naff"
 	if (( naff == 0 )); then dbg "phase B: SKIPPED - naff==0 (no pool job yet), Phase A's khs=$khs stands"; note_state shallow; return 0; fi   # legitimate: no pool job yet, benign - Phase A's total stands
 
@@ -483,53 +508,75 @@ run() {
 	# below have their own redundant bash-regex fallback, but the --argjson s "$sense" use further down does
 	# not: an empty $sense there is a hard --argjson error, not a graceful "not verified" outcome.
 	{ [[ -n $sense ]] && jq -e . > /dev/null 2>&1 <<< "$sense"; } || sense='{"cpus":[],"pkg_temp":null,"power_w":null,"ccd_reason":""}'
-	pkg_temp=$(jq -c '.pkg_temp' <<< "$sense")
-	# A jq failure (e.g. a transient fork/exec failure under resource pressure) would otherwise leave
-	# $pkg_temp empty, which is NOT valid JSON - and $pkg_temp is fed into `--argjson` below (both branches of
-	# the percore/rows split), where jq treats an invalid --argjson value as a FATAL argument error: the
-	# entire `rows=` computation would then silently produce nothing, cascading into $complete/$phaseb_total
-	# also being empty two steps later. Defined default: this cosmetic detail (a single row's temperature, in
-	# the unverified/per-thread path) is worth losing to a transient jq hiccup; the RATE Phase B is here to
-	# compute is never allowed to depend on this succeeding (see below).
+	# ONE jq call for both fields, not two - a jq failure (e.g. a transient fork/exec failure under resource
+	# pressure) would otherwise leave $pkg_temp/$power_raw empty, which is NOT valid JSON - and both are fed
+	# into `--argjson` further down (the percore/rows split, and the final compose), where jq treats an invalid
+	# --argjson value as a FATAL argument error: the entire `rows=` computation would then silently produce
+	# nothing, cascading into $complete/$phaseb_total also being empty two steps later. Defined default per
+	# field: this cosmetic detail (a single row's temperature, in the unverified/per-thread path) is worth
+	# losing to a transient jq hiccup; the RATE Phase B is here to compute is never allowed to depend on this
+	# succeeding (see below).
+	IFS=$'\t' read -r pkg_temp power_raw <<< "$(jq -r '
+		[(if (.pkg_temp | type) == "number" then (.pkg_temp | tostring) else "null" end),
+		 (if (.power_w | type) == "number" then (.power_w | tostring) else "null" end)] | @tsv
+	' <<< "$sense" 2>/dev/null)"
 	[[ $pkg_temp =~ ^(null|[0-9.]+)$ ]] || { dbg "phase B: pkg_temp invalid/empty (jq failure?) - forcing null, was: $pkg_temp"; pkg_temp=null; }
-	power_raw=$(jq -c '.power_w' <<< "$sense")
 	[[ $power_raw =~ ^(null|[0-9.]+)$ ]] || { dbg "phase B: power_raw invalid/empty (jq failure?) - forcing null, was: $power_raw"; power_raw=null; }
 
 	# ---- binding verification, budget permitting (the /proc task scan is also inside the timed child)
 	percore=0
 	remaining_us
-	if have_budget_us "$REPLY" && jq -e --argjson s "$sense" 'all(.affinity >= 0) and (map(.affinity as $a | ($s.cpus | any(.cpu == $a))) | all)' \
-		<<< "$threads" > /dev/null 2>&1
-	then
-		task_set='[]'
-		if [[ -d $PROC/$owner_pid/task ]]; then
-			task_set=$(awk '
-				/^Cpus_allowed_list:/ {
-					val = $0
-					sub(/^Cpus_allowed_list:[ \t]*/, "", val)
-					gsub(/[ \t\r]/, "", val)
-					if (val == "") next
-					n = split(val, parts, ",")
-					count = 0; last = ""; bad = 0
-					for (i = 1; i <= n && !bad; i++) {
-						if (parts[i] ~ /^[0-9]+-[0-9]+$/) {
-							split(parts[i], rg, "-")
-							count += (rg[2] + 0) - (rg[1] + 0) + 1
-							last = rg[1] + 0
-						} else if (parts[i] ~ /^[0-9]+$/) {
-							count += 1
-							last = parts[i] + 0
-						} else {
-							bad = 1
+	if have_budget_us "$REPLY"; then
+		# ONE jq call for the gate check AND $api_set together, not two - the gate ("every thread's affinity is
+		# a CPU bloxsense's own topology also knows") is a PRECONDITION for percore, never sufficient alone (the
+		# task_set comparison below is what actually confirms it), but computing $api_set only costs something
+		# when the gate might pass, so both still happen in the SAME call rather than two.
+		gate_out=$(jq -r --argjson s "$sense" '
+			if (all(.affinity >= 0) and (map(.affinity as $a | ($s.cpus | any(.cpu == $a))) | all))
+			then "1\t" + ([.[].affinity] | sort | tojson)
+			else "0\t[]" end
+		' <<< "$threads" 2>/dev/null)
+		gate_ok=0; api_set='[]'
+		[[ -n $gate_out ]] && IFS=$'\t' read -r gate_ok api_set <<< "$gate_out"
+		[[ $gate_ok == 1 ]] || { gate_ok=0; api_set='[]'; }
+		if (( gate_ok )); then
+			task_set='[]'
+			if [[ -d $PROC/$owner_pid/task ]]; then
+				# `jq -R -c -n '[inputs | ...] | sort'` reads every awk-emitted line via `inputs` in ONE jq
+				# invocation - the same result as the old `jq -R '...' | jq -s 'sort'` two-call pipe, one fork
+				# fewer. `-c` is NOT optional here: without it this prints PRETTY (multi-line, indented) JSON by
+				# default, while $api_set below is built via `tojson` (always compact) - the two would never be
+				# string-equal even for identical sets, defeating the whole point of comparing them as strings.
+				task_set=$(awk '
+					/^Cpus_allowed_list:/ {
+						val = $0
+						sub(/^Cpus_allowed_list:[ \t]*/, "", val)
+						gsub(/[ \t\r]/, "", val)
+						if (val == "") next
+						n = split(val, parts, ",")
+						count = 0; last = ""; bad = 0
+						for (i = 1; i <= n && !bad; i++) {
+							if (parts[i] ~ /^[0-9]+-[0-9]+$/) {
+								split(parts[i], rg, "-")
+								count += (rg[2] + 0) - (rg[1] + 0) + 1
+								last = rg[1] + 0
+							} else if (parts[i] ~ /^[0-9]+$/) {
+								count += 1
+								last = parts[i] + 0
+							} else {
+								bad = 1
+							}
+							if (count > 1) break
 						}
-						if (count > 1) break
+						if (!bad && count == 1) print last
 					}
-					if (!bad && count == 1) print last
-				}
-			' "$PROC/$owner_pid"/task/*/status 2>/dev/null | jq -R 'select(length > 0) | tonumber' | jq -s 'sort')
+				' "$PROC/$owner_pid"/task/*/status 2>/dev/null | jq -R -c -n '[inputs | select(length > 0) | tonumber] | sort')
+			fi
+			# Plain bash string equality, not a third jq fork: both $task_set and $api_set are produced by jq's
+			# own `sort`+default/compact array serialization (deterministic for a given set of integers), so
+			# their STRING forms are exactly comparable without re-parsing either one as JSON again.
+			[[ -n $task_set && $task_set == "$api_set" ]] && percore=1
 		fi
-		api_set=$(jq -c '[.[].affinity] | sort' <<< "$threads")
-		jq -e -n --argjson t "$task_set" --argjson a "$api_set" '$t == $a' > /dev/null 2>&1 && percore=1
 	fi
 
 	# rate0 is null (never a fabricated 0) for any thread whose own hashrate[0] is missing/invalid - a row
@@ -546,28 +593,39 @@ run() {
 	# deferred below, to right after write_result's own success is known, with a REJECTED outcome logged as
 	# "shallow" (this poll's own answer IS just the total, same as Phase A settling for its own answer earlier
 	# in this file) rather than silently keeping whatever note_state last happened to say.
+	# ONE jq call computes rows, $complete and $phaseb_total together (used to be up to four forks: the rows
+	# computation itself, a separate `all(...)` pass for $complete, and a jq+awk pipe for $phaseb_total's own
+	# %.2f formatting - a CI-trace-measured cost center, bot review: "rows 0.60s, consistency 0.16s" on a GH
+	# 2-vCPU runner). $hs_json/$temp_json are ALSO emitted here directly (the per-row khs/temp arrays the final
+	# compose step needs below) so that step no longer has to re-derive them from $rows via two more forks.
 	if (( percore )); then
-		rows=$(jq -c --argjson s "$sense" '
+		rows_out=$(jq -r --argjson s "$sense" '
 			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite)) then null elif $r < 0 then 0 else $r end;
 			($s.cpus | map({key: (.cpu | tostring), value: {pkg: .pkg, core: .core, temp: .temp}}) | from_entries) as $topo
-			| map(. + {pc: $topo[(.affinity | tostring)], r0: rate0})
-			| group_by([.pc.pkg, .pc.core])
-			| map(
-				(map(.r0)) as $rates
-				| if any($rates[]; . == null) then {khs: null, temp: .[0].pc.temp}
-				  else {khs: ((map(.r0 / 1000) | add) * 100 | round / 100), temp: .[0].pc.temp} end)' <<< "$threads")
+			| (map(. + {pc: $topo[(.affinity | tostring)], r0: rate0})
+			   | group_by([.pc.pkg, .pc.core])
+			   | map((map(.r0)) as $rates
+			         | if any($rates[]; . == null) then {khs: null, temp: .[0].pc.temp}
+			           else {khs: ((map(.r0 / 1000) | add) * 100 | round / 100), temp: .[0].pc.temp} end)) as $rows
+			| ($rows | all(.khs != null)) as $complete
+			| (($rows | map(.khs) | map(select(. != null)) | add // 0)) as $total
+			| [$complete, $total, ($rows | map(.khs) | tojson), ($rows | map(.temp) | tojson), ($rows | tojson)] | @tsv
+		' <<< "$threads" 2>/dev/null)
 	else
-		rows=$(jq -c --argjson pt "$pkg_temp" '
+		rows_out=$(jq -r --argjson pt "$pkg_temp" '
 			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite)) then null elif $r < 0 then 0 else $r end;
-			map(rate0 as $r0 | if $r0 == null then {khs: null, temp: $pt} else {khs: (($r0 / 1000) * 100 | round / 100), temp: $pt} end)' <<< "$threads")
+			(map(rate0 as $r0 | if $r0 == null then {khs: null, temp: $pt} else {khs: (($r0 / 1000) * 100 | round / 100), temp: $pt} end)) as $rows
+			| ($rows | all(.khs != null)) as $complete
+			| (($rows | map(.khs) | map(select(. != null)) | add // 0)) as $total
+			| [$complete, $total, ($rows | map(.khs) | tojson), ($rows | map(.temp) | tojson), ($rows | tojson)] | @tsv
+		' <<< "$threads" 2>/dev/null)
 	fi
+	complete=false; phaseb_total=""; hs_json=""; temp_json=""; rows=""
+	[[ -n $rows_out ]] && IFS=$'\t' read -r complete phaseb_total hs_json temp_json rows <<< "$rows_out"
 	dbg "phase B: percore=$percore rows=${rows:0:300}"
-
-	complete=$(jq -r 'all(.[]; .khs != null)' <<< "$rows")
-	phaseb_total=$(jq -r '[.[].khs] | map(select(. != null)) | add // 0' <<< "$rows" | awk '{printf "%.2f", $1}')
 	# $complete/$phaseb_total must come out exactly "true"/"false" and a plain non-negative number,
 	# respectively - anything else (typically empty: a transient jq fork/exec failure under resource pressure,
-	# or $rows itself being malformed/empty from the step above) is a FAILED computation, not a legitimate
+	# or $rows_out itself being malformed/empty from the step above) is a FAILED computation, not a legitimate
 	# "incomplete" or "zero" reading, and must be logged as such rather than silently falling through - relying
 	# on bash's `[[ "" == true ]]` being false (which happens to also reject Phase B here, but for the wrong
 	# reason, unlogged) is exactly the class of silent failure a slow/resource-pressured runner can hide for a
@@ -582,6 +640,11 @@ run() {
 		dbg "phase B: FAILED - \$phaseb_total came back invalid/empty (was: '$phaseb_total') - Phase A's khs=$khs stands"
 		complete=false; phaseb_total=0
 	fi
+	printf -v phaseb_total '%.2f' "$phaseb_total"   # bash builtin, no fork - same 2-decimal convention as
+		# khs_fresh in Phase A; jq's own number formatting drops trailing/all zeros ("16", "16.5"), so this is
+		# reformatted here rather than trusted as-is, exactly like Phase A already does for its own total.
+	[[ -n $hs_json ]] || hs_json='[]'
+	[[ -n $temp_json ]] || temp_json='[]'
 	# consistent := Phase A itself has no confident positive rate (khs_fresh == 0 - nothing to protect a
 	# complete Phase B reading from), OR the two totals agree within 10% of Phase A's own value. A near-zero
 	# Phase B total quietly replacing a HEALTHY (positive) Phase A rate is exactly the false-zero this rule
@@ -621,13 +684,19 @@ run() {
 		# write_result() ITSELF also independently refuses an empty/malformed $stats or non-numeric $khs (see
 		# its own header) - belt and suspenders: even a gap in this validation, upstream of write_result, could
 		# never actually land invalid JSON in $OUTFILE.
-		local new_stats
+		local new_stats ar_json
 		[[ -n ${BLOX_HSTATS_TEST_FORCE_STATS_FAIL:-} ]] && power_raw='BROKEN'   # tests only: not valid JSON,
 			# so the --argjson below fails fatally - simulates the transient jq/fork failure this whole
 			# validate-before-write guard exists for, without weakening anything it guards against
-		[[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && dbg "phase B: composing final stats - hs_src=$(jq -c '[.[].khs]' <<< "$rows" 2>&1) temp_src=$(jq -c '[.[].temp]' <<< "$rows" 2>&1) acc=$acc rej=$rej uptime=$uptime ver=$VER algo=$algo power_raw=$power_raw"
-		if new_stats=$(jq -nc --argjson hs "$(jq -c '[.[].khs]' <<< "$rows")" --argjson temp "$(jq -c '[.[].temp]' <<< "$rows")" \
-				--argjson ar "$(jq -nc --argjson a "$acc" --argjson r "$rej" '[$a, $r]')" --argjson uptime "$uptime" \
+		# $hs_json/$temp_json: already computed by the SAME jq call that produced $rows above - reused here
+		# rather than re-derived via two more forks (the old "4 jq forks deep" compose, now 1). $ar_json: a
+		# forkless bash string, not a third `jq -nc --argjson a ... --argjson r ... '[$a,$r]'` call - $acc/$rej
+		# are already int()-validated plain-digit strings by this point (see Phase A), safe to interpolate
+		# directly into a JSON array literal with no further escaping needed.
+		ar_json="[${acc},${rej}]"
+		[[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && dbg "phase B: composing final stats - hs_src=$hs_json temp_src=$temp_json acc=$acc rej=$rej uptime=$uptime ver=$VER algo=$algo power_raw=$power_raw"
+		if new_stats=$(jq -nc --argjson hs "$hs_json" --argjson temp "$temp_json" \
+				--argjson ar "$ar_json" --argjson uptime "$uptime" \
 				--arg ver "$VER" --arg algo "$algo" --argjson power "$power_raw" \
 				'{hs: $hs, hs_units: "khs", temp: $temp, ar: $ar, uptime: $uptime, ver: $ver, algo: $algo}
 				 + (if ($power | type) == "number" and $power > 0 then {cpu_power: $power} else {} end)') \
@@ -680,38 +749,44 @@ KILL_GRACE=0.3      # extra time after SIGTERM before SIGKILL - bounds the hard 
 # captured from the child's stdout. Never a pipe: a command-substitution pipe only reaches EOF once every
 # process that ever held its write end (including an orphan that somehow escaped the kill) has closed it, so a
 # survivor could hang this parent forever. Reading a plain file back never blocks on a stale writer.
-# P2 (bot review): both OUTFILE and HANDSHAKE are reset to empty HERE, unconditionally, before either mktemp is
-# even attempted - this file is sourced repeatedly in the SAME shell (Hive's own agent, poll after poll; see
-# this package's own "repeated polls" test), so these are plain, non-local globals that could otherwise still
-# hold a PREVIOUS poll's own path if some future edit ever restructured this block in a way that skipped one of
-# the assignments below - resetting first means there is never a stale path left around to accidentally act on.
-OUTFILE=""; HANDSHAKE=""
-OUTFILE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-x-hstats-out.XXXXXX") || OUTFILE=""
+# OUTFILE/HANDSHAKE are plain paths inside $TMPD (see the mktemp -d above) - this file is sourced repeatedly in
+# the SAME shell (Hive's own agent, poll after poll; see this package's own "repeated polls" test), but there is
+# no stale-value hazard to reset against any more: $TMPD, and so both of these, are freshly (re)computed from
+# it every single poll, unconditionally, right here.
+OUTFILE="$TMPD/out"
 # The child reports its OWN pgid, AFTER its setsid has taken effect, into this handshake file - this script
 # never reads the child's pgid via `ps` itself. Right after backgrounding, the new process may still be
 # running with the FORK-INHERITED pgid (ours, or whatever our own caller's is) for a brief window before it
 # reaches its own setsid() call; reading `ps -o pgid=` at that instant would see that inherited pgid, and a
 # later group-kill against it could hit our own caller instead of the collection. Only a value the child
 # itself reports, once it truly is isolated, is ever trusted for a group-wide signal.
-HANDSHAKE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-x-hstats-hs.XXXXXX") || HANDSHAKE=""
-PARENT_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
+HANDSHAKE="$TMPD/hs"
 export OUTFILE
 
-if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
-	# shellcheck disable=SC2016   # $1/$2 are the child bash's own positional parameters, not this shell's
-	BUDGET_US="$BUDGET_US" DEADLINE_US="$DEADLINE_US" setsid bash -c '
-		[[ -n ${BLOX_HSTATS_TEST_HANDSHAKE_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_HANDSHAKE_DELAY"   # tests only
-		{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
-		. "$1"
-		run
-	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>>"${BLOX_HSTATS_DEBUG_LOG:-/dev/null}" &
-	# stderr from EVERYTHING inside run() (every jq/awk/curl call's own error text, otherwise completely
-	# invisible - a jq argument/parse failure prints there, not to $OUTFILE) goes to $BLOX_HSTATS_DEBUG_LOG
-	# when debugging, /dev/null otherwise (unchanged production behavior: this file is sourced by Hive's own
-	# agent, which must never see anything on this script's stdout/stderr - see the file header). A plain
-	# redirect, evaluated once right here in the parent, before the fork - no extra process, debugging or not.
-	CPID=$!
+# shellcheck disable=SC2016   # $1/$2 are the child bash's own positional parameters, not this shell's
+BUDGET_US="$BUDGET_US" DEADLINE_US="$DEADLINE_US" setsid bash -c '
+	[[ -n ${BLOX_HSTATS_TEST_HANDSHAKE_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_HANDSHAKE_DELAY"   # tests only
+	{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
+	. "$1"
+	run
+' _ "$LIB" "$HANDSHAKE" > /dev/null 2>>"${BLOX_HSTATS_DEBUG_LOG:-/dev/null}" &
+# stderr from EVERYTHING inside run() (every jq/awk/curl call's own error text, otherwise completely
+# invisible - a jq argument/parse failure prints there, not to $OUTFILE) goes to $BLOX_HSTATS_DEBUG_LOG
+# when debugging, /dev/null otherwise (unchanged production behavior: this file is sourced by Hive's own
+# agent, which must never see anything on this script's stdout/stderr - see the file header). A plain
+# redirect, evaluated once right here in the parent, before the fork - no extra process, debugging or not.
+CPID=$!
+# PARENT_PGID: deliberately computed HERE, AFTER backgrounding the child above - not before, as an earlier
+# version of this file did. This fork (`ps`) no longer sits in the serial "poll-entry -> summary-request-sent"
+# critical path at all (another "cheap to cut" startup cost, bot review): it now overlaps with the child's own
+# work, which has ALREADY started running concurrently the instant `&` returned, instead of delaying it. A
+# process's own pgid cannot change just because it backgrounds a child (this parent never calls setsid itself),
+# so the VALUE read here is identical to whatever reading it earlier would have produced - only the timing
+# changed. Needed only by validated_pgid() below, never called before the poll loop's first iteration - ample
+# time for this fork to complete well before anything actually depends on its result.
+PARENT_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
 
+{
 	# A group-kill is only ever attempted against a pgid that: came from the handshake (so it is what the
 	# child itself measured, post-setsid, not a guess made from out here), equals $CPID (confirming the child
 	# became its own session/process-group leader), and differs from our own pgid and from 0/1 (confirming
@@ -796,7 +871,6 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# already-safely-written answer (at minimum Phase A's own fresh total - see write_result's own atomic
 	# tmp+rename and the file header's Phase A/B design) is never held hostage by how long reaping $CPID takes.
 	result=$(cat "$OUTFILE" 2>/dev/null)
-	rm -f "$OUTFILE" "$HANDSHAKE"
 	# No explicit `wait "$CPID"` at all, deliberately: SIGKILL has already terminated $CPID by this point
 	# (unblockable, immediate, regardless of this shell's own scheduling) - what a trailing `wait` here would
 	# actually be doing is REAPING it (clearing the zombie), a bookkeeping step with no bearing on the answer
@@ -810,18 +884,13 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# somehow never were, the kernel reparents and reaps any still-pending zombie the moment this process's own
 	# parent (Hive's agent, or whatever sourced this file) eventually exits. Trading a worst-case INDEFINITE
 	# hang for, at most, one transient zombie entry between polls is the right side of that trade.
-else
-	# P2 (bot review): at least one of the two mktemp calls above failed - but NOT NECESSARILY both. If OUTFILE
-	# succeeded and only HANDSHAKE failed (or vice versa), the one that DID succeed is a real file already sitting
-	# on disk that nothing else will ever remove: the collection never even starts in this branch, so run()'s own
-	# atomic tmp+rename into $OUTFILE never happens, and the "if" branch's own `rm -f "$OUTFILE" "$HANDSHAKE"`
-	# never runs either. Sourced repeatedly in the same long-lived Hive agent shell, that leaked a file per such
-	# poll (e.g. /tmp genuinely out of inodes/quota - exactly the condition under which a mktemp failure here is
-	# most likely in the first place). `rm -f` on whichever variable is still empty is always a safe no-op.
-	rm -f "$OUTFILE" "$HANDSHAKE"
-	result=""
-fi
-rm -f "$LIB"
+}
+# ONE `rm -rf "$TMPD"` covers LIB+OUTFILE+HANDSHAKE together, after $OUTFILE has already been read into
+# $result above - no more separate cleanup branches for "the group ran" vs "it couldn't start" (the old P2
+# bot-review fix this replaces): with a single `mktemp -d` allocation (see its own header comment above), there
+# is no longer a partial-success case where only SOME of these three paths exist and need individually
+# guarded removal.
+rm -rf "$TMPD"
 
 # Whatever $OUTFILE holds - Phase A's answer, or Phase B's richer one, or nothing at all if the child was
 # killed before Phase A even finished writing - is used as-is: no cache, no age bound, no re-verification for

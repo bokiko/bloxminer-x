@@ -114,7 +114,13 @@ with open(os.path.join(root, "net", "tcp"), "w") as f:
 	f.write("   0: 0100007F:%s 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 %d 1 0000000000000000 100 0 0 10 0\n" % (hexport, TARGET_INODE))
 PY
 
-SUM_OK=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0"}')
+# hashrate.total[0] = 16496 (H/s): the sum of BACK_OK's own 32 per-thread rates below (500+c for c in 0..31) -
+# real XMRig always reports summary.hashrate.total as that sum (null/0 only in the first seconds after startup,
+# when the threads themselves are still null too - see the dedicated startup case near the end of this file).
+# A CI trace (bot review) caught this fixture reporting hashrate-less (summary total 0) while BACK_OK's own
+# threads were healthy and non-null - a shape no real rig can produce - which made Phase A's own honest 0 look
+# like a false zero once Phase B ran out of time on a slow runner, when the real bug was an unrealistic fixture.
+SUM_OK=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0", hashrate: {total: [16496.0]}}')
 BACK_OK=$(python3 -c '
 import json
 threads = [{"affinity": c, "hashrate": [500.0 + c, None, None]} for c in range(32)]
@@ -358,7 +364,9 @@ with open(os.path.join(root, "net", "tcp"), "w") as f:
 	f.write("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
 	f.write("   0: 0100007F:%s 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 %d 1 0000000000000000 100 0 0 10 0\n" % (hexport, TARGET_INODE))
 PY
-SUM3=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0"}')
+# hashrate.total[0] = 2006 (H/s): sum of BACK3's own 4 per-thread rates below (500+c for c in 0..3) - same
+# realism rationale as SUM_OK above.
+SUM3=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0", hashrate: {total: [2006.0]}}')
 BACK3=$(python3 -c '
 import json
 threads = [{"affinity": c, "hashrate": [500.0 + c, None, None]} for c in range(4)]
@@ -420,29 +428,34 @@ unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
 # own API3B server above) - only the API server differs here (a fixed response delay added), everything else
 # about the fixture's shape is the same already-justified "realistic, not artificially heavy" choice made above.
 #
-# DELAY4=1.5s, not the ~1.85 s this finding was originally described with: measured directly (own isolated
-# harness, both on a quiet ai02 and under this exact saturate_tier(1)+taskset -c 0 combination), a delay that
-# close to curl's own max-time window (remaining budget minus PHASE_A_CURL_RESERVE_US, itself ~2.0 s here) is
-# NOT reliably survivable - not because the RESERVE this case exists to prove is too small (it never is: no
-# hard-cap breach was ever observed), but because curl's own allotted window is what runs out first, under a
-# genuinely single-CPU-pinned, 4x-oversubscribed (K=4) rig where the PARENT's own poll loop and the CHILD doing
-# the curl both compete for that same one core (inherited CPU affinity across fork()) on top of the busy loops.
-# That is a real, reproducible characteristic distinct from either bot-review finding this round fixes - worth
-# reporting (and a plausible contributor to the still-open GitHub 5.01 s investigation) rather than papering
-# over by picking a looser delay without saying why. 1.5 s is still solidly past the OLD, since-fixed flat
-# 0.5 s/0.6 s summary-curl cap this whole finding chain started from (3x), while leaving reliable margin within
-# the realistic available window even under this case's own worst-case contention.
+# DELAY4 is DERIVED, not a guessed/picked constant (a bot-review finding on a sibling package: a fixed ~1.85 s
+# spec failed 20/20 on a slow GitHub runner, because the delay is measured from when the request is SENT, which
+# is AFTER the parent's own start-up work - on a slow/contended vCPU that start-up alone can eat into the
+# budget "by construction", regardless of how generous the post-curl reserve is).
+#   D = budget - (measured start-up x2) - reserve - 0.1s
+# "measured start-up" = poll-entry -> summary-request-sent, i.e. EVERYTHING before the mandatory curl is even
+# issued (manifest sourcing, the algo jq parse, the TMPD mktemp -d, writing $LIB, the setsid child's own launch,
+# and the ownership /proc scan inside it) - measured with a standalone harness, taskset -c 0 + saturate_tier(1)
+# (the SAME K=4-oversubscribed single-CPU scenario this case itself runs under), 30 iterations: max 207 ms on
+# ai02. Doubled for margin against start-up itself being slower than this sample happened to catch (not just
+# the common case) - the same reasoning PHASE_A_CURL_RESERVE_US's own measurement uses a safety multiplier for.
+#   D = 2.4 - (0.207 * 2) - 0.3 - 0.1 = 1.586s -> 1.5s (rounded down, matching what the same standalone harness
+# also confirmed reliably survivable under this exact load).
+# Startup cost ITSELF was also cut where cheap this round (bot review's other suggestion): LIB/OUTFILE/HANDSHAKE
+# merged from three mktemp calls into one `mktemp -d`, and PARENT_PGID's own `ps` fork moved to AFTER the child
+# is backgrounded (so it overlaps the child's own work instead of serializing before it) - paired before/after
+# measurement, same harness, same sustained K=4 load: avg start-up 175ms -> 148ms (-15%), max 222ms -> 207ms
+# (-7%, the number D is derived from above).
 DELAY4=1.5
 API4_PID=""
 cleanup4() { [[ -n $API4_PID ]] && { kill "$API4_PID" 2>/dev/null; wait "$API4_PID" 2>/dev/null; }; stop_saturating; }
 trap 'cleanup; cleanup3; cleanup4' EXIT
-# A DEDICATED summary fixture, not $SUM3 as-is: $SUM3 (case 3's own fixture, above) has no "hashrate" key at
-# all, relying entirely on $BACK3's per-thread rates for a nonzero result - fine for that case's own purpose,
-# but it would make THIS test's "khs>0 every poll" assertion pass trivially for the wrong reason whenever Phase
-# B gets skipped (exactly what the delayed summary is expected to cause, by eating most of the budget) - Phase
+# Reuses $SUM3 as-is (not a separate fixture): now that SUM3 carries a realistic hashrate.total consistent with
+# BACK3's own per-thread sum (see SUM3's own definition above), Phase A's OWN total here is both nonzero AND
+# realistic, which is what THIS test's "khs>0 every poll" assertion needs to mean something whenever Phase B
+# gets skipped (exactly what the delayed summary is expected to cause, by eating most of the budget) - Phase
 # A's OWN total must be the thing proven nonzero here, since that is what this finding is actually about.
-SUM4=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0", hashrate: {total: [1234.56]}}')
-jq -n --argjson s "$SUM4" --argjson b "$BACK3" --argjson d "$DELAY4" '{summary: $s, backends: $b, delay: $d}' > "$T/replies4.json"
+jq -n --argjson s "$SUM3" --argjson b "$BACK3" --argjson d "$DELAY4" '{summary: $s, backends: $b, delay: $d}' > "$T/replies4.json"
 : > "$T/api4.out"
 python3 "$HERE/fake_xmrig_api.py" 4072 "$T/replies4.json" > "$T/api4.out" 2>&1 & API4_PID=$!
 for _ in $(seq 50); do grep -q ready "$T/api4.out" && break; sleep 0.1; done
@@ -483,8 +496,95 @@ fi
 kill "$API4_PID" 2>/dev/null; wait "$API4_PID" 2>/dev/null
 unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
 
+# ================================================================== case 4b: summary delayed past the WHOLE
+# budget - not "close to the edge" (case 4, above) but past it outright. The collector must still come back
+# within the hard cap, with a bounded, honest 0 - never a hang, and never anything resembling case 4's healthy
+# result. Same light fixture (BLOX_DIR3/PROC3), own port + own (much longer) delay.
+API4B_PID=""
+cleanup4b() { [[ -n $API4B_PID ]] && { kill "$API4B_PID" 2>/dev/null; wait "$API4B_PID" 2>/dev/null; }; stop_saturating; }
+trap 'cleanup; cleanup3; cleanup4; cleanup4b' EXIT
+DELAY4B=10   # comfortably longer than BUDGET_US (2.4s) + KILL_GRACE (0.3s) + this suite's own HARD_CAP4 (4.0s)
+jq -n --argjson s "$SUM3" --argjson b "$BACK3" --argjson d "$DELAY4B" '{summary: $s, backends: $b, delay: $d}' > "$T/replies4b.json"
+: > "$T/api4b.out"
+python3 "$HERE/fake_xmrig_api.py" 4072 "$T/replies4b.json" > "$T/api4b.out" 2>&1 & API4B_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api4b.out" && break; sleep 0.1; done
+grep -q ready "$T/api4b.out" || bad "Phase A delay > budget: fake API startup" "$(cat "$T/api4b.out" 2>/dev/null)"
+# Port 4072, same as case 4 above (not a new one): PROC3's /proc/net/tcp fixture (built once, earlier in this
+# file) hardcodes that single listening port - case 4's own API server was already killed before this one
+# starts, so reusing it here is safe and avoids yet another fixture rebuild for no benefit.
+export BLOX_DIR="$BLOX_DIR3" BLOX_PROCFS_ROOT="$PROC3" BLOX_API_PORT=4072
+if command -v taskset > /dev/null 2>&1; then
+	saturate_tier 1; sleep 0.3
+	N_POLLS4B=5; HARD_CAP4B=4.0
+	n_bad4b=0; max4b=0
+	for i in $(seq 1 "$N_POLLS4B"); do
+		t0=$(date +%s.%N)
+		# shellcheck disable=SC2016   # $BLOX_DIR/$khs expand in the inner bash -c, not here
+		res=$(timeout 5 taskset -c 0 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+		t1=$(date +%s.%N)
+		elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+		pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+		# Must be the literal fallback "0" (no answer ever arrived in time), not Phase A's own formatted "0.00"
+		# (a real, parsed, honest zero) - and bounded within the hard cap, never longer.
+		if [[ $pkhs != 0 ]] || awk -v e="$elapsed" -v c="$HARD_CAP4B" 'BEGIN{exit !(e > c)}'; then
+			n_bad4b=$((n_bad4b+1)); echo "  poll $i: unexpected ($res, ${elapsed}s)"
+		fi
+		awk -v e="$elapsed" -v m="$max4b" 'BEGIN{exit !(e > m)}' && max4b=$elapsed
+	done
+	stop_saturating
+	if (( n_bad4b == 0 )); then
+		ok "Phase A: summary delayed ${DELAY4B}s (past the whole budget) -> bounded honest 0, max ${max4b}s"
+	else
+		bad "Phase A: summary delayed ${DELAY4B}s (past the whole budget) -> bounded honest 0" "n_bad=$n_bad4b max=${max4b}s"
+	fi
+else
+	echo "SKIP: taskset not available - Phase A delay>budget case skipped"
+fi
+kill "$API4B_PID" 2>/dev/null; wait "$API4B_PID" 2>/dev/null
+unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
+
+# ================================================================== case 4c: the genuine early-startup moment -
+# summary.hashrate.total null/0 AND backends threads null (no pool job assigned yet) - the ONE real-XMRig shape
+# where Phase A's own 0 is the honest answer, not a bug (a bot-review finding: an UNREALISTIC fixture earlier in
+# this file, summary total 0 while threads were healthy and non-null - a shape no real rig can produce - made
+# this honest case indistinguishable from a false zero once Phase B ran out of time; see SUM_OK/SUM3 above).
+# Distinguished from case 4b's fallback "0" by format: this is Phase A's own %.2f-formatted "0.00", a real
+# parsed answer, never the bare "0" literal fallback() uses when nothing was collected at all.
+API4C_PID=""
+cleanup4c() { [[ -n $API4C_PID ]] && { kill "$API4C_PID" 2>/dev/null; wait "$API4C_PID" 2>/dev/null; }; stop_saturating; }
+trap 'cleanup; cleanup3; cleanup4; cleanup4b; cleanup4c' EXIT
+SUM_STARTUP=$(jq -nc '{uptime: 0, connection: {accepted: 0, rejected: 0}, algo: "rx/0", version: "6.26.0", hashrate: {total: [null]}}')
+BACK_STARTUP='[{"type":"cpu","threads":null}]'
+jq -n --argjson s "$SUM_STARTUP" --argjson b "$BACK_STARTUP" '{summary: $s, backends: $b}' > "$T/replies4c.json"
+: > "$T/api4c.out"
+python3 "$HERE/fake_xmrig_api.py" 4072 "$T/replies4c.json" > "$T/api4c.out" 2>&1 & API4C_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api4c.out" && break; sleep 0.1; done
+grep -q ready "$T/api4c.out" || bad "startup case: fake API startup" "$(cat "$T/api4c.out" 2>/dev/null)"
+export BLOX_DIR="$BLOX_DIR3" BLOX_PROCFS_ROOT="$PROC3" BLOX_API_PORT=4072   # same port 4072 - see case 4b's own comment above
+if command -v taskset > /dev/null 2>&1; then
+	saturate_tier 1; sleep 0.3
+	N_POLLS4C=5
+	n_bad4c=0
+	for i in $(seq 1 "$N_POLLS4C"); do
+		# shellcheck disable=SC2016   # $BLOX_DIR/$khs expand in the inner bash -c, not here
+		res=$(timeout 5 taskset -c 0 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+		pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+		[[ $pkhs == 0.00 ]] || { n_bad4c=$((n_bad4c+1)); echo "  poll $i: unexpected ($res)"; }
+	done
+	stop_saturating
+	if (( n_bad4c == 0 )); then
+		ok "startup case: summary total null, threads null -> honest Phase A 0.00, not a false zero"
+	else
+		bad "startup case: summary total null, threads null -> honest Phase A 0.00, not a false zero" "n_bad=$n_bad4c"
+	fi
+else
+	echo "SKIP: taskset not available - startup case skipped"
+fi
+kill "$API4C_PID" 2>/dev/null; wait "$API4C_PID" 2>/dev/null
+unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT
+
 leaked=()
-for p in "$API_PID" "$API3_PID" "${API3B_PID:-}" "${API4_PID:-}"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done
+for p in "$API_PID" "$API3_PID" "${API3B_PID:-}" "${API4_PID:-}" "${API4B_PID:-}" "${API4C_PID:-}"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done
 if [[ ${#leaked[@]} -eq 0 ]]; then
 	ok "no leaked fake-API child processes at suite end"
 else
