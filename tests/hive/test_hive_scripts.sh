@@ -148,7 +148,12 @@ export BLOX_PROCFS_ROOT=$PROC
 : > "$BLOX_DIR/bloxsense"; chmod +x "$BLOX_DIR/bloxsense"
 FAKE_PID=4242
 
-reset_proc() { rm -rf "$PROC"; mkdir -p "$PROC/net"; : > "$PROC/net/tcp"; }
+reset_proc() {   # also clears any cached bloxsense reading (see SENSE_MAX_AGE_S in h-stats.sh) left by a
+	# PREVIOUS, unrelated scenario - every new scenario this suite sets up is meant to be independent, not a
+	# real rig's own unchanging sensors polled repeatedly (see stats_case()'s own fuller explanation above).
+	rm -rf "$PROC"; mkdir -p "$PROC/net"; : > "$PROC/net/tcp"
+	rm -f "$BLOX_DIR/.bloxminer-x-hstats-sense" "${STATE2:-}/.bloxminer-x-hstats-sense" 2>/dev/null
+}
 listen() {   # port inode exe-target
 	local hex; hex=$(printf '%04X' "$1")
 	{
@@ -183,6 +188,13 @@ PY
 
 stats_case() {   # name port summary-json backends-json-or-empty jq-assertion
 	kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+	# Each stats_case() call is meant to simulate an INDEPENDENT poll with its own bloxsense fixture, not a real
+	# rig's genuinely unchanging sensors polled repeatedly - a stale SENSEFILE left by a PREVIOUS, unrelated
+	# test case would otherwise make h-stats.sh's own bloxsense cache (see SENSE_MAX_AGE_S) correctly, but
+	# unhelpfully, serve a DIFFERENT test's cached reading here. Clearing it is test-isolation hygiene, not a
+	# product workaround - a real rig never has this problem, since its sensors do not change fixture between
+	# polls the way this suite's own many back-to-back scenarios do.
+	rm -f "$BLOX_DIR/.bloxminer-x-hstats-sense"
 	local port=$2
 	if [[ -n $3 ]]; then
 		jq -n --argjson s "$3" --argjson b "${4:-[]}" '{summary: $s, backends: $b}' > "$T/replies.json"
@@ -369,6 +381,89 @@ stats_case "empty bloxsense output (healthy summary+backends) -> safe sensor def
 	20032 "$SUM_OK" "$BACK_SOME_REAL" '.stats.temp == [null, null, null, null] and (.stats.hs | add) == 7'
 bloxsense_says "$(fake_topo_json 4)"
 
+# ---- bloxsense caching (SENSE_MAX_AGE_S): a bot-review finding - bloxsense's own ~0.55 s RAPL sample was, by a
+# wide margin, the single biggest cost in Phase B, and the real cause of a GitHub 2-vCPU runner occasionally
+# missing the WHOLE budget with no saturation at all (see tests/hive/test_under_load.sh's own per-poll phase
+# timings). A COUNTING bloxsense stub (not bloxsense_says()'s own static one) proves the cache's three real
+# properties directly, not just its effect on timing: a fresh poll invokes bloxsense, an immediately-following
+# poll reuses the cached reading WITHOUT invoking bloxsense again, and an EXPIRED cache invokes it again.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+SENSE_COUNT_FILE="$T/sense_count"; echo 0 > "$SENSE_COUNT_FILE"
+cat > "$BLOX_DIR/bloxsense" <<EOF
+#!/bin/sh
+n=\$(cat "$SENSE_COUNT_FILE")
+n=\$((n + 1))
+echo "\$n" > "$SENSE_COUNT_FILE"
+echo '{"cpus":[{"cpu":0,"pkg":0,"core":0,"temp":55,"src":"core"},{"cpu":1,"pkg":0,"core":0,"temp":55,"src":"core"},{"cpu":2,"pkg":0,"core":1,"temp":56,"src":"core"},{"cpu":3,"pkg":0,"core":1,"temp":56,"src":"core"}],"pkg_temp":70,"power_w":95.0,"ccd_reason":"sense cache test"}'
+EOF
+chmod +x "$BLOX_DIR/bloxsense"
+reset_proc; listen 20046 1046 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20046 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+export BLOX_API_PORT=20046
+# shellcheck disable=SC2016
+bash -c '. "$BLOX_DIR/h-stats.sh"' > /dev/null 2>&1
+count_after_1=$(cat "$SENSE_COUNT_FILE")
+# shellcheck disable=SC2016
+bash -c '. "$BLOX_DIR/h-stats.sh"' > /dev/null 2>&1
+count_after_2=$(cat "$SENSE_COUNT_FILE")
+if [[ $count_after_1 == 1 && $count_after_2 == 1 ]]; then
+	ok "bloxsense caching: poll 1 invokes bloxsense, poll 2 (same cache window) reuses it, no re-invocation"
+else
+	bad "bloxsense caching: poll 1 invokes bloxsense, poll 2 (same cache window) reuses it, no re-invocation" \
+		"count_after_1=$count_after_1 count_after_2=$count_after_2"
+fi
+# Expire the cache by hand (same technique as every other ts=-based cache test in this file) - the ts= line is
+# the SENSEFILE's own first line (see h-stats.sh's SENSEFILE/SENSE_MAX_AGE_S header for the format). 35 s ago is
+# past h-stats.sh's own SENSE_MAX_AGE_S (30 s) without hardcoding that constant's exact value into this test.
+sense_epoch_us=${EPOCHREALTIME/./}; sense_epoch_us=${sense_epoch_us:0:16}   # EPOCHREALTIME -> integer microseconds, no fork
+sense_expired_ts=$(( sense_epoch_us - 35 * 1000000 ))
+sense_cached_body=$(tail -n +2 "$BLOX_DIR/.bloxminer-x-hstats-sense")
+printf 'ts=%s\n%s' "$sense_expired_ts" "$sense_cached_body" > "$BLOX_DIR/.bloxminer-x-hstats-sense.tmp"
+mv -f "$BLOX_DIR/.bloxminer-x-hstats-sense.tmp" "$BLOX_DIR/.bloxminer-x-hstats-sense"
+# shellcheck disable=SC2016
+bash -c '. "$BLOX_DIR/h-stats.sh"' > /dev/null 2>&1
+count_after_3=$(cat "$SENSE_COUNT_FILE")
+if [[ $count_after_3 == 2 ]]; then
+	ok "bloxsense caching: an EXPIRED cache (age > SENSE_MAX_AGE_S) invokes bloxsense again"
+else
+	bad "bloxsense caching: an EXPIRED cache (age > SENSE_MAX_AGE_S) invokes bloxsense again" "count_after_3=$count_after_3"
+fi
+# A FAILED/invalid bloxsense read must never poison the cache - confirmed by forcing one, then a good read
+# right after, and checking the cache now holds the GOOD reading (not stuck serving/caching the bad one).
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+rm -f "$BLOX_DIR/.bloxminer-x-hstats-sense"
+cat > "$BLOX_DIR/bloxsense" <<'EOF'
+#!/bin/sh
+echo 'not valid json'
+EOF
+chmod +x "$BLOX_DIR/bloxsense"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20046 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+# shellcheck disable=SC2016
+bash -c '. "$BLOX_DIR/h-stats.sh"' > /dev/null 2>&1
+no_cache_from_bad_read=0
+[[ -f $BLOX_DIR/.bloxminer-x-hstats-sense ]] || no_cache_from_bad_read=1
+cat > "$BLOX_DIR/bloxsense" <<EOF
+#!/bin/sh
+echo '{"cpus":[],"pkg_temp":65,"power_w":90.0,"ccd_reason":"good again"}'
+EOF
+chmod +x "$BLOX_DIR/bloxsense"
+# shellcheck disable=SC2016
+res_after_bad=$(bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+cpu_power_after_bad=$(jq -r '.stats.cpu_power' <<< "$res_after_bad" 2>/dev/null)
+if (( no_cache_from_bad_read )) && [[ -s $BLOX_DIR/.bloxminer-x-hstats-sense ]] && \
+	awk -v p="${cpu_power_after_bad:-0}" 'BEGIN{exit !(p == 90)}'; then
+	ok "bloxsense caching: an invalid/failed reading is never cached, a good one right after is"
+else
+	bad "bloxsense caching: an invalid/failed reading is never cached, a good one right after is" \
+		"no_cache_from_bad_read=$no_cache_from_bad_read res=$res_after_bad"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+rm -f "$BLOX_DIR/.bloxminer-x-hstats-sense"
+bloxsense_says "$(fake_topo_json 4)"
+
 # ---- inconsistent totals: Phase A's own fresh total is healthy and positive, but Phase B's own (complete,
 # no nulls) total disagrees with it by far more than the 10% tolerance - treated as INCONSISTENT, never as a
 # fresher answer, so Phase A's own total (the one `/2/summary` call XMRig itself just answered) stands. This is
@@ -439,6 +534,11 @@ fi
 # ---- budget: ONE shared 3.0 s deadline - a slow step gets whatever is left, never more, and the whole run
 #      (ownership check + both curls + bloxsense) stays comfortably under 3.2 s wall time even in bad cases.
 run_hstats_timed() {   # -> sets $res $elapsed (wall time, seconds)
+	# Same test-isolation reasoning as stats_case()'s own cleanup above: several of this helper's OWN callers
+	# swap in a different (slow/hanging/instant) bloxsense fixture between calls specifically to test timing
+	# behavior - a stale cached reading from a PREVIOUS call would let a later call skip the very bloxsense
+	# invocation its own test exists to time.
+	rm -f "$BLOX_DIR/.bloxminer-x-hstats-sense"
 	local a b
 	a=$(date +%s.%N)
 	# shellcheck disable=SC2016   # $BLOX_DIR/$khs/$stats are meant to expand inside the inner bash -c, not here
@@ -822,7 +922,7 @@ sed -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/config2.json#" \
     -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/log2/bloxminer-x#" "$BLOX_DIR/h-manifest.conf" > "$PKG2/h-manifest.conf"
 jq -n '{pools: [{algo: "rx/0"}]}' > "$T/config2.json"
 STATE2="$T/state2"; LOG2="$T/log2/bloxminer-x.stats.log"; MAINLOG2="$T/log2/bloxminer-x.log"
-run_pkg2() { mkdir -p "$STATE2" "$T/log2"; BLOX_DIR=$PKG2 BLOX_STATE_DIR=$STATE2 BLOX_API_PORT=$1 BLOX_PROCFS_ROOT=$PROC \
+run_pkg2() { mkdir -p "$STATE2" "$T/log2"; rm -f "$STATE2/.bloxminer-x-hstats-sense"; BLOX_DIR=$PKG2 BLOX_STATE_DIR=$STATE2 BLOX_API_PORT=$1 BLOX_PROCFS_ROOT=$PROC \
 	bash -c '. "$BLOX_DIR/h-stats.sh"' > /dev/null 2>&1; }
 loglines() { grep -c "$1" "$LOG2" 2>/dev/null || true; }
 

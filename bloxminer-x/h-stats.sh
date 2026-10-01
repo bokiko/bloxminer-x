@@ -112,7 +112,13 @@ STATEFILE="$STATEDIR/.bloxminer-x-hstats-state"
 # never a hashrate. Read by Phase A only to fill in a single row's temperature when Phase B does not run this
 # poll; a wrong-by-a-poll-or-two cached temperature has no watchdog-reboot consequence, unlike a cached rate.
 ENRICHFILE="$STATEDIR/.bloxminer-x-hstats-enrich"
-export PROC PKG PORT VER algo STATEFILE ENRICHFILE CUSTOM_LOG_BASENAME
+# SENSEFILE: the last full bloxsense reading (topology + temps + power), cached and reused across polls within
+# SENSE_MAX_AGE_S (see its own definition and Phase B's use of this file for the full rationale) - unlike
+# ENRICHFILE (a single display temperature, used only when Phase B does not run at all this poll), this is read
+# routinely, as part of Phase B's own normal operation, specifically to avoid paying bloxsense's own ~0.55 s
+# RAPL sample cost on every single poll.
+SENSEFILE="$STATEDIR/.bloxminer-x-hstats-sense"
+export PROC PKG PORT VER algo STATEFILE ENRICHFILE SENSEFILE CUSTOM_LOG_BASENAME
 
 # The whole collection lives in one function library file so the parent's own fallback path (used only when
 # the LIB/OUTFILE/HANDSHAKE temp files themselves cannot be created) and the timed child (the real work) run
@@ -208,6 +214,16 @@ wait_secs() {
 # shows null instead. This bounds a cosmetic detail only - see the file header for why khs is never bounded
 # this way at all (there is no cached khs to bound).
 ENRICH_MAX_AGE_S=90
+# SENSE_MAX_AGE_S: how old a cached bloxsense reading (see SENSEFILE) may be before Phase B pays for a fresh
+# RAPL sample again - deliberately shorter than ENRICH_MAX_AGE_S above: that one bounds a last-resort, rarely-
+# hit cosmetic fallback (Phase B not running at all), while this one is hit on the file's own common, every-
+# poll path, so a smaller bound keeps displayed temp/power meaningfully fresh. 30 s covers this whole file's own
+# test suite's rapid-fire polling (several polls complete well inside that window, each one skipping the ~0.55 s
+# RAPL sample entirely after the first) while still refreshing well inside even an aggressive real Hive polling
+# interval (seconds to tens of seconds) - package TOPOLOGY, also cached here, never goes stale at all on a
+# running rig, but is still bounded by the same window rather than cached forever, so a hypothetical topology
+# change is never stuck for longer than this.
+SENSE_MAX_AGE_S=30
 
 # _rx_pid_start <pid> - sets $REPLY to that pid's own starttime field (22nd field of /proc/<pid>/stat, robust
 # to spaces or parens inside the comm field by scanning from the LAST ')'), or empty if unreadable. No fork:
@@ -320,6 +336,7 @@ run() {
 	local port_hex inode owner_pid owned fd_dir sum uptime acc rej khs_fresh pidstart enrich_temp
 	local back threads naff sense pkg_temp power_raw percore task_set api_set rows
 	local parsed_back gate_out gate_ok rows_out hs_json temp_json
+	local sense_fresh_read sense_valid sense_raw sense_ts_line sense_ts sense_age
 	local exe_link curl_rc PHASE_A_CURL_RESERVE_US curl_budget_us
 
 	remaining_us; dbg "run() entry: remaining_us=$REPLY"
@@ -498,23 +515,67 @@ run() {
 	dbg "phase B: naff=$naff"
 	if (( naff == 0 )); then dbg "phase B: SKIPPED - naff==0 (no pool job yet), Phase A's khs=$khs stands"; note_state shallow; return 0; fi   # legitimate: no pool job yet, benign - Phase A's total stands
 
-	# ---- sensors: whatever is left, capped at min(remaining, 1.0 s) - bloxsense's own RAPL sample is ~0.55 s
+	# ---- sensors: a CACHED bloxsense reading, refreshed at most once every SENSE_MAX_AGE_S - a CI trace finding
+	# (bot review): bloxsense's own RAPL sample (~0.55 s on every call) was, by a wide margin, the single biggest
+	# cost in Phase B (measured breakdown on ai02, unloaded: phaseA=0.01s curl=0.01s jq=0.00s bloxsense=0.55s
+	# rows=0.02s write=0.01s - bloxsense alone is ~92% of Phase B's own total), and the real cause of a GitHub
+	# 2-vCPU runner occasionally missing the WHOLE budget even with NO saturation at all. Package topology
+	# (which CPU belongs to which physical core) never changes on a running rig, and temperature/power readings
+	# tolerate being a little stale (the SAME reasoning ENRICHFILE already uses for the single-row display
+	# temperature, just applied here to the full sensor read instead of only the cosmetic fallback case) - a
+	# fresh RAPL sample on EVERY poll was never actually required for correctness, only for freshness, and only
+	# within a bound this cache still enforces.
 	remaining_us
-	if have_budget_us "$REPLY"; then
-		# --foreground: keep bloxsense in the SAME process group as this script (and the outer timeout wrapping
-		# the whole run below) instead of a new one of its own - otherwise a bloxsense that ignores SIGTERM
-		# could end up in a process group the outer timeout's kill never reaches, and survive as an orphan.
-		cap_us "$REPLY" 1000000; us_to_secstr "$REPLY"
-		sense=$(timeout --foreground "$REPLY" "$PKG/bloxsense" --json 2>&1); dbg "phase B: bloxsense rc=$? len=${#sense} body=${sense:0:200}"
+	sense_fresh_read=0; sense=""
+	if [[ -f $SENSEFILE ]]; then
+		sense_raw=$(<"$SENSEFILE")   # bash's own $(<file) fast path - forkless, no cat/subshell exec
+		sense_ts_line=${sense_raw%%$'\n'*}
+		sense_ts=${sense_ts_line#ts=}
+		# SECURITY: $sense_ts is file content, not a bash-internal integer - same class of site as ENRICHFILE's
+		# own "ts=" (see that file's read site above): require strict digits-only BEFORE the arithmetic use
+		# below, never trust it as-is.
+		if [[ $sense_ts =~ ^[0-9]+$ ]]; then
+			now_us; sense_age=$(( (REPLY - sense_ts) / 1000000 )); (( sense_age < 0 )) && sense_age=0
+			if (( sense_age <= SENSE_MAX_AGE_S )); then
+				sense=${sense_raw#*$'\n'}
+				[[ -z $sense ]] && sense=""   # a cache file with no second line is not a usable reading
+			fi
+		fi
+	fi
+	if [[ -z $sense ]]; then
+		if have_budget_us "$REPLY"; then
+			# --foreground: keep bloxsense in the SAME process group as this script (and the outer timeout
+			# wrapping the whole run below) instead of a new one of its own - otherwise a bloxsense that ignores
+			# SIGTERM could end up in a process group the outer timeout's kill never reaches, and survive as an
+			# orphan.
+			cap_us "$REPLY" 1000000; us_to_secstr "$REPLY"
+			sense=$(timeout --foreground "$REPLY" "$PKG/bloxsense" --json 2>&1); dbg "phase B: bloxsense rc=$? len=${#sense} body=${sense:0:200}"
+			sense_fresh_read=1
+		else
+			note_state shallow; return 0
+		fi
 	else
-		note_state shallow; return 0
+		dbg "phase B: bloxsense SKIPPED - using cached sense reading, age=${sense_age}s (<= ${SENSE_MAX_AGE_S}s)"
 	fi
 	# `[[ -n $sense ]] &&` first - same rationale as the backends check above (jq 1.6's `-e` exits 0 on EMPTY
 	# input). An empty $sense (bloxsense killed before producing any output, or crashed silently) used to skip
 	# this fallback on jq 1.6, leaving $sense empty instead of the safe default object - pkg_temp/power_raw
 	# below have their own redundant bash-regex fallback, but the --argjson s "$sense" use further down does
 	# not: an empty $sense there is a hard --argjson error, not a graceful "not verified" outcome.
-	{ [[ -n $sense ]] && jq -e . > /dev/null 2>&1 <<< "$sense"; } || sense='{"cpus":[],"pkg_temp":null,"power_w":null,"ccd_reason":""}'
+	sense_valid=0
+	if [[ -n $sense ]] && jq -e . > /dev/null 2>&1 <<< "$sense"; then
+		sense_valid=1
+	else
+		sense='{"cpus":[],"pkg_temp":null,"power_w":null,"ccd_reason":""}'
+	fi
+	# Cache a fresh, genuinely valid reading for subsequent polls - never a failed/empty one (that would poison
+	# the cache into permanently serving the safe-default object instead of ever retrying), and never a reading
+	# that came FROM the cache in the first place (no point rewriting the same bytes with a newer timestamp,
+	# which would only extend its effective lifetime past SENSE_MAX_AGE_S for no reason).
+	if (( sense_fresh_read && sense_valid )); then
+		now_us
+		{ printf 'ts=%s\n%s' "$REPLY" "$sense" > "$SENSEFILE.tmp" && mv -f "$SENSEFILE.tmp" "$SENSEFILE"; } 2>/dev/null
+	fi
 	# ONE jq call for both fields, not two - a jq failure (e.g. a transient fork/exec failure under resource
 	# pressure) would otherwise leave $pkg_temp/$power_raw empty, which is NOT valid JSON - and both are fed
 	# into `--argjson` further down (the percore/rows split, and the final compose), where jq treats an invalid

@@ -220,19 +220,57 @@ kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 # Phase B has no excuse not to finish - every poll must return the full 16 per-core rows, never the 1-row
 # fallback. This is what actually catches a per-core regression (the property f619829 fixed), now isolated from
 # the saturation tolerance above instead of conflated with it.
+# GH CI finding: this guard FAILED (n_bad=2/5) on a real 2-vCPU runner with NO saturation at all - a genuine
+# product signal (per-core stats dropping out too often on small/slow boxes), not a test artifact. Per-poll
+# phase timings below (Phase A, backends curl, the merged naff/threads/validate jq, bloxsense, rows+compose,
+# write) are printed COMPACTLY for every poll, pass or fail, from this file's own existing dbg() timestamps -
+# no new instrumentation added to h-stats.sh itself, just parsed out of what it already logs - so CI shows
+# where time actually goes on whatever runner hits this, not just a bare pass/fail.
+print_phase_timings() {   # $1 = debug log path; prints one compact "phaseA=.. curl=.. jq=.. bloxsense[cached]=.. rows=.. write=.. total=.." line
+	awk '
+		{ ts = $1 }
+		!a && /phase A: entry/ { a = ts }
+		!ad && /phase A: DONE/ { ad = ts }
+		!b && /phase B: entry/ { b = ts }
+		!bc && /phase B: curl .*\/2\/backends/ { bc = ts }
+		!nf && /phase B: naff=/ { nf = ts }
+		!bs && /phase B: bloxsense rc=/ { bs = ts }
+		!bs && /phase B: bloxsense SKIPPED - using cached/ { bs = ts; cached = 1 }
+		!cmp && /phase B: composing final stats/ { cmp = ts }
+		!ex && /run\(\) EXIT/ { ex = ts }
+		END {
+			out = ""
+			if (a && ad) out = out sprintf("phaseA=%.3f ", ad - a); else out = out "phaseA=? "
+			if (b && bc) out = out sprintf("curl=%.3f ", bc - b); else out = out "curl=? "
+			if (bc && nf) out = out sprintf("jq=%.3f ", nf - bc); else out = out "jq=? "
+			label = cached ? "bloxsense[cached]=" : "bloxsense="
+			if (nf && bs) out = out sprintf("%s%.3f ", label, bs - nf); else out = out label "? "
+			if (bs && cmp) out = out sprintf("rows=%.3f ", cmp - bs); else out = out "rows=? "
+			if (cmp && ex) out = out sprintf("write=%.3f ", ex - cmp); else out = out "write=? "
+			if (a && ex) out = out sprintf("total=%.3f", ex - a); else out = out "total=?"
+			print out
+		}
+	' "$1" 2>/dev/null
+}
 python3 "$HERE/fake_xmrig_api.py" 4069 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 grep -q ready "$T/api.out" || bad "per-core regression guard: fake API startup" "$(cat "$T/api.out" 2>/dev/null)"
 N_POLLS1B=5
 n_bad1b=0
 for i in $(seq 1 "$N_POLLS1B"); do
+	DBG1B="$T/dbg1b_$i.log"; rm -f "$DBG1B"
 	# shellcheck disable=SC2016
-	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+	res=$(BLOX_HSTATS_DEBUG_LOG="$DBG1B" timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
 	khs=$(jq -r '.khs' <<< "$res" 2>/dev/null)
 	nrows=$(jq -r '.stats.hs | length' <<< "$res" 2>/dev/null)
+	timing=$(print_phase_timings "$DBG1B")
+	echo "  poll $i: $timing"
 	if [[ $khs != 16.50 ]] || [[ $nrows != 16 ]]; then
 		n_bad1b=$((n_bad1b+1)); echo "  poll $i: unexpected (khs=$khs rows=$nrows res=$res)"
+		echo "  poll $i: --- BLOX_HSTATS_DEBUG_LOG ---"
+		sed 's/^/  poll '"$i"' dbg: /' "$DBG1B" 2>/dev/null
 	fi
+	rm -f "$DBG1B"
 done
 if (( n_bad1b == 0 )); then
 	ok "per-core regression guard (unloaded): khs=16.50, 16 per-core rows, every poll ($N_POLLS1B polls)"
