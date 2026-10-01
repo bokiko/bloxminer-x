@@ -142,6 +142,13 @@ TMPD=$(mktemp -d "${TMPDIR:-/tmp}/bloxminer-x-hstats.XXXXXX") || {
 	# inside it being a builtin - and this whole block exists BECAUSE mktemp (a fork) just failed, i.e. exactly
 	# the resource-pressure state a further fork here could fail in too, leaving $stats empty rather than this
 	# defined fallback. printf -v assigns in the current shell, no fork at all.
+	# $VER/$algo interpolated raw (no escaping) into this hand-built JSON: SECURITY-reviewed safe, same rationale
+	# fallback() documents at its own definition below - $VER is CUSTOM_VERSION, a fixed constant from this
+	# package's own shipped h-manifest.conf, never from the XMRig API or any other external source; $algo is
+	# already regex-validated (^rx/[a-z0-9]+$) by the time execution can ever reach here. Neither can contain a
+	# `"` or `\`. XMRig's OWN API `.version` field is never extracted into this file's output anywhere (grep
+	# confirms: only ever type-checked, "is this a real XMRig reply", then discarded) - unlike a sibling package
+	# where that field WAS embedded unescaped into hand-built JSON, this file has no such path to begin with.
 	khs=0
 	printf -v stats '{"hs":[0],"hs_units":"khs","temp":[null],"ar":[0,0],"uptime":0,"ver":"%s","algo":"%s"}' "$VER" "$algo"
 	return 0 2>/dev/null || exit 0

@@ -1022,5 +1022,30 @@ fi
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 rm -f "$BLOX_DIR/.bloxminer-x-hstats-enrich"
 
+# ---- JSON-escaping: a sibling package embedded the XMRig API's OWN .version field, unescaped, into hand-built
+# JSON - a version string containing a quote or backslash broke every poll's published JSON. Confirmed this
+# file has no such path (grep: .version is only ever type-checked, "is this a real XMRig reply", then
+# discarded - never extracted into output; $VER is this package's own fixed CUSTOM_VERSION constant, $algo is
+# already regex-validated before ANY hand-built-JSON use - see fallback()'s own header), but a fake API
+# returning that exact adversarial version string is a permanent, cheap regression test rather than trusting a
+# one-time code read.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+SUM_VER_ESCAPE=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0\"\\x", hashrate: {total: [2006.0]}}')
+reset_proc; listen 20044 1044 "$BLOX_DIR/xmrig"
+jq -n --argjson s "$SUM_VER_ESCAPE" --argjson b null '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20044 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+n_bad_ver=0
+for _ in 1 2 3; do
+	res=$(BLOX_API_PORT=20044 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+	jq -e . > /dev/null 2>&1 <<< "$res" || n_bad_ver=$((n_bad_ver+1))
+done
+if (( n_bad_ver == 0 )); then
+	ok "JSON escaping: API version containing a quote+backslash -> still valid JSON every poll"
+else
+	bad "JSON escaping: API version containing a quote+backslash -> still valid JSON every poll" "n_bad=$n_bad_ver last=$res"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
