@@ -1073,12 +1073,14 @@ stdout_out=$(BLOX_DIR=$PKG2 BLOX_STATE_DIR=$STATE2 BLOX_API_PORT=20024 BLOX_PROC
 if [[ -z $stdout_out ]]; then ok "state log: nothing is ever printed to stdout"; else bad "state log: nothing is ever printed to stdout" "stdout=$stdout_out"; fi
 
 # ================================================================== SECURITY: arithmetic-context injection
-# Every value this file ever reads from the XMRig HTTP API (jq), bloxsense, or $ENRICHFILE must pass a strict
-# regex/type check BEFORE it can reach a bash arithmetic context ((( )), $(( )), [[ -le/-lt/-gt ]], etc): that
-# context recursively re-evaluates an operand that still looks like an expression, so an unvalidated value there
-# is root-level command injection (this collector runs as root on a real Hive rig). A fake API, a fake bloxsense,
-# and a hand-crafted $ENRICHFILE each supply a payload shaped like `a[$(touch <marker>)]` in every numeric field
-# this file reads; none may ever create the marker file, and the poll must still return a safe, defined result.
+# Every value this file ever reads from the XMRig HTTP API (jq), bloxsense, $ENRICHFILE, or $SENSEFILE must pass
+# a strict regex/type check BEFORE it can reach a bash arithmetic context ((( )), $(( )), [[ -le/-lt/-gt ]],
+# etc): that context recursively re-evaluates an operand that still looks like an expression, so an unvalidated
+# value there is root-level command injection (this collector runs as root on a real Hive rig). A fake API, a
+# fake bloxsense, a hand-crafted $ENRICHFILE, and a hand-crafted $SENSEFILE (its own "ts=" field, plus a
+# deliberately non-JSON body) each supply a payload shaped like `a[$(touch <marker>)]` in every numeric/cached
+# field this file reads; none may ever create the marker file, and the poll must still return a safe, defined
+# result.
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 MARK_INJ="$T/injmark"; rm -f "${MARK_INJ}".*
 # shellcheck disable=SC2016   # deliberately literal: this is the attack PAYLOAD text itself (must reach h-stats.sh
@@ -1100,6 +1102,13 @@ bloxsense_says "$(jq -n --arg t "$INJ_TEMP" '{cpus: [{cpu: 0, pkg: 0, core: 0, t
 # inside the format string is the literal payload $ENRICHFILE's ts=/temp= lines must carry, verbatim.
 printf 'ts=a[$(touch %s.enrich)]\npid=%s\nstart=1234567890\ntemp=a[$(touch %s.enrichtemp)]\n' \
 	"$MARK_INJ" "$FAKE_PID" "$MARK_INJ" > "$BLOX_DIR/.bloxminer-x-hstats-enrich"
+# SENSEFILE: same class of site as ENRICHFILE's own "ts=" above - the cached-bloxsense-reading age check. A
+# malicious "ts=" line here (gated by the SAME ^[0-9]+$ regex before any arithmetic use) and a non-JSON,
+# payload-carrying body (never reaches arithmetic at all - only ever passed through jq's own --argjson, which
+# parses-or-errors, never evaluates shell) are both exercised together.
+# shellcheck disable=SC2016   # literal payload text, not meant to expand here - same rationale as above.
+printf 'ts=a[$(touch %s.sensets)]\nnot valid json a[$(touch %s.sensebody)]' \
+	"$MARK_INJ" "$MARK_INJ" > "$BLOX_DIR/.bloxminer-x-hstats-sense"
 
 jq -n --argjson s "$SUM_INJ" --argjson b "$BACK_INJ" '{summary: $s, backends: $b}' > "$T/replies.json"
 : > "$T/api.out"
@@ -1110,9 +1119,9 @@ grep -q ready "$T/api.out" || bad "injection: fake API did not start" "$(cat "$T
 res=$(BLOX_STATE_DIR=$BLOX_DIR BLOX_API_PORT=20040 BLOX_PROCFS_ROOT=$PROC bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
 
 if ! ls "${MARK_INJ}".* > /dev/null 2>&1; then
-	ok "injection: API/bloxsense/ENRICHFILE payloads never execute (no marker file)"
+	ok "injection: API/bloxsense/ENRICHFILE/SENSEFILE payloads never execute (no marker file)"
 else
-	bad "injection: API/bloxsense/ENRICHFILE payloads never execute (no marker file)" "created: $(ls "${MARK_INJ}".* 2>/dev/null)"
+	bad "injection: API/bloxsense/ENRICHFILE/SENSEFILE payloads never execute (no marker file)" "created: $(ls "${MARK_INJ}".* 2>/dev/null)"
 fi
 if [[ $(jq -r '.khs' <<< "$res" 2>/dev/null) =~ ^[0-9]+\.[0-9]{2}$ ]]; then
 	ok "injection: poll still returns a safe, defined result (malicious fields forced to 0/null, never passed through)"
