@@ -981,5 +981,55 @@ reset_proc   # a transition-worthy run (unavailable), captured without discardin
 stdout_out=$(BLOX_DIR=$PKG2 BLOX_STATE_DIR=$STATE2 BLOX_API_PORT=20024 BLOX_PROCFS_ROOT=$PROC bash -c '. "$BLOX_DIR/h-stats.sh"' 2>/dev/null)
 if [[ -z $stdout_out ]]; then ok "state log: nothing is ever printed to stdout"; else bad "state log: nothing is ever printed to stdout" "stdout=$stdout_out"; fi
 
+# ================================================================== SECURITY: arithmetic-context injection
+# Every value this file ever reads from the XMRig HTTP API (jq), bloxsense, or $ENRICHFILE must pass a strict
+# regex/type check BEFORE it can reach a bash arithmetic context ((( )), $(( )), [[ -le/-lt/-gt ]], etc): that
+# context recursively re-evaluates an operand that still looks like an expression, so an unvalidated value there
+# is root-level command injection (this collector runs as root on a real Hive rig). A fake API, a fake bloxsense,
+# and a hand-crafted $ENRICHFILE each supply a payload shaped like `a[$(touch <marker>)]` in every numeric field
+# this file reads; none may ever create the marker file, and the poll must still return a safe, defined result.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+MARK_INJ="$T/injmark"; rm -f "${MARK_INJ}".*
+# shellcheck disable=SC2016   # deliberately literal: this is the attack PAYLOAD text itself (must reach h-stats.sh
+# as the literal characters `a[$(touch ...)]`, never pre-expanded by THIS shell) - the whole point of the test.
+INJ='a[$(touch '"$MARK_INJ"'.api)]'
+SUM_INJ=$(jq -n --arg u "$INJ" '{uptime: $u, connection: {accepted: $u, rejected: $u}, algo: "rx/0", version: "6.26.0", hashrate: {total: [$u]}}')
+BACK_INJ=$(jq -n --arg u "$INJ" '[{type: "cpu", threads: [{affinity: 0, hashrate: [$u, null, null]}]}]')
+
+reset_proc; listen 20040 2040 "$BLOX_DIR/xmrig"
+task "t0" "0"
+# /proc/<pid>/stat: field 22 (starttime) is the 20th whitespace-separated token after the ")" (see
+# _rx_pid_start()'s own header) - a fixed, valid fake value, matched by $ENRICHFILE's "start=" line below so the
+# enrichment branch is actually entered (an empty/mismatched pidstart would skip it entirely, proving nothing).
+printf '%s (xmrig) S 1 2040 2040 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 1234567890\n' "$FAKE_PID" > "$PROC/$FAKE_PID/stat"
+# shellcheck disable=SC2016   # same as above: a literal payload string, not an expression meant to expand here.
+INJ_TEMP='a[$(touch '"$MARK_INJ"'.sense)]'
+bloxsense_says "$(jq -n --arg t "$INJ_TEMP" '{cpus: [{cpu: 0, pkg: 0, core: 0, temp: 55, src: "core"}], pkg_temp: $t, power_w: $t, ccd_reason: "inj"}')"
+# shellcheck disable=SC2016   # %s is the printf conversion, not a shell expansion - the `$(touch ...)]` text
+# inside the format string is the literal payload $ENRICHFILE's ts=/temp= lines must carry, verbatim.
+printf 'ts=a[$(touch %s.enrich)]\npid=%s\nstart=1234567890\ntemp=a[$(touch %s.enrichtemp)]\n' \
+	"$MARK_INJ" "$FAKE_PID" "$MARK_INJ" > "$BLOX_DIR/.bloxminer-x-hstats-enrich"
+
+jq -n --argjson s "$SUM_INJ" --argjson b "$BACK_INJ" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20040 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+grep -q ready "$T/api.out" || bad "injection: fake API did not start" "$(cat "$T/api.out")"
+
+res=$(BLOX_STATE_DIR=$BLOX_DIR BLOX_API_PORT=20040 BLOX_PROCFS_ROOT=$PROC bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+
+if ! ls "${MARK_INJ}".* > /dev/null 2>&1; then
+	ok "injection: API/bloxsense/ENRICHFILE payloads never execute (no marker file)"
+else
+	bad "injection: API/bloxsense/ENRICHFILE payloads never execute (no marker file)" "created: $(ls "${MARK_INJ}".* 2>/dev/null)"
+fi
+if [[ $(jq -r '.khs' <<< "$res" 2>/dev/null) =~ ^[0-9]+\.[0-9]{2}$ ]]; then
+	ok "injection: poll still returns a safe, defined result (malicious fields forced to 0/null, never passed through)"
+else
+	bad "injection: poll still returns a safe, defined result (malicious fields forced to 0/null, never passed through)" "$res"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+rm -f "$BLOX_DIR/.bloxminer-x-hstats-enrich"
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -329,11 +329,46 @@ run() {
 	dbg "ownership: PORT=$PORT port_hex=$port_hex inode=${inode:-<none>} owner_pid=${owner_pid:-<none>} exe_link=${exe_link:-<none>} expected=$PKG/xmrig owned=$owned"
 	if (( ! owned )); then note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; fi
 
+	# ---- cached temperature lookup (pid+starttime keyed) - done HERE, before Phase A's curl/parse below, not
+	# after: it depends only on $owner_pid (already known above), never on anything the curl/jq parse produces,
+	# so doing it first keeps Phase A's post-curl critical path down to exactly the one jq call that parse needs
+	# (see the PHASE_A_CURL_RESERVE_US comment below) instead of also paying for this lookup's own work - forkless,
+	# but not free - inside the window that reserve is sized against.
+	_rx_pid_start "$owner_pid"; pidstart=$REPLY
+	enrich_temp="null"
+	if [[ -n $pidstart && -f $ENRICHFILE ]]; then
+		local e_ts="" e_pid="" e_start="" e_temp="" e_age
+		while IFS='=' read -r ek ev; do
+			case $ek in ts) e_ts=$ev ;; pid) e_pid=$ev ;; start) e_start=$ev ;; temp) e_temp=$ev ;; esac
+		done < "$ENRICHFILE" 2>/dev/null
+		# SECURITY: $e_ts is file content (read from $ENRICHFILE above), not a bash-internal integer like every
+		# other operand this file ever puts in an arithmetic context - under normal operation this script is the
+		# only writer (always a plain `now_us` integer, see the write side below), but that is NOT a guarantee:
+		# bash recursively evaluates an arithmetic operand that still looks like an expression, so an unvalidated
+		# string here (e.g. a hand-edited, raced, or maliciously replaced STATEDIR file containing something like
+		# "ts=a[$(touch /tmp/x)]") would execute arbitrary code with this collector's own privileges (root, on a
+		# real Hive rig) the instant `$(( (REPLY - e_ts) / ... ))` below evaluated it. Require strict digits-only
+		# BEFORE the arithmetic use, same discipline as every jq/API-derived value elsewhere in this file (see
+		# int()) - a non-numeric or tampered file is simply treated as "no cached temperature", never evaluated.
+		if [[ $e_ts =~ ^[0-9]+$ && $e_pid == "$owner_pid" && $e_start == "$pidstart" ]]; then
+			now_us; e_age=$(( (REPLY - e_ts) / 1000000 )); (( e_age < 0 )) && e_age=0
+			# $e_temp is ALSO file content. It is never put in an arithmetic context (so it is not the same class
+			# of bug as $e_ts above), but it now flows straight into the single jq --argjson call below with no
+			# intermediate validation of its own - a malformed value there would make that WHOLE call fail (jq
+			# itself rejects invalid JSON for --argjson), silently losing a result that could otherwise have
+			# published. Gate it to "looks like a bare JSON number or null" first, same belt-and-suspenders
+			# discipline as every other cached/file-derived value in this function.
+			[[ $e_age -le $ENRICH_MAX_AGE_S && $e_temp =~ ^(null|[0-9]+(\.[0-9]+)?)$ ]] && enrich_temp=$e_temp
+		fi
+	fi
+
 	# ================================================================ PHASE A (mandatory, cheap, this poll)
-	# The ONLY network call and the ONLY jq invocation this phase needs: one GET (parse+validate+extract are a
-	# SINGLE jq call, not three) to /2/summary, which already carries the aggregate hashrate, accepted/rejected
-	# and uptime - real-Hive evidence (1 CPU, 32 threads all saturating it) is that every avoided fork here
-	# matters, so this phase forks only what curl/find/awk/readlink/jq themselves cannot be done without.
+	# The ONLY network call and the ONLY jq invocation this phase needs: one GET to /2/summary, and ONE jq call
+	# that parses+validates+extracts AND composes the final stats JSON together (not a separate parse call and a
+	# separate `jq -nc` compose call - see the P1 finding below) - real-Hive evidence (1 CPU, 32 threads all
+	# saturating it) is that every avoided fork here matters, so this phase forks only what curl/find/awk/
+	# readlink/jq themselves cannot be done without; everything that does NOT need the curl's response (the
+	# cached-temperature lookup above) is deliberately done BEFORE this point for the same reason.
 	remaining_us; dbg "phase A: entry remaining_us=$REPLY"
 	have_budget_us "$REPLY" || { dbg "phase A: OUT OF BUDGET before the curl call"; note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; }
 	# This curl is the ONE mandatory step every poll needs - unlike Phase B's OPTIONAL steps below (each capped
@@ -344,9 +379,23 @@ run() {
 	# budget still unused) - the SAME lesson this file's own fork-free design already learned elsewhere (a cap
 	# chosen to assume the worst, rather than derived from what is actually left, kills an honest-but-slow
 	# answer for no reason). PHASE_A_CURL_RESERVE_US is SUBTRACTED from whatever remains, never a flat ceiling
-	# against it: a measured, generous bound for the one jq parse and one write_result call still needed once
-	# this curl returns (0.3 s - comfortably above either even under full CPU saturation: one jq fork, and
-	# write_result is a plain printf+mv with no fork of its own).
+	# against it.
+	#
+	# A SECOND P1 finding (bot review, after the first fix above): even with the curl itself budgeted correctly,
+	# the fixed reserve covering the WORK AFTER curl returns was sized by assumption, not measurement, and
+	# originally had to cover TWO separate jq forks (one to parse, one more `jq -nc` to compose the final JSON) -
+	# under the exact CPU saturation this reserve exists for, that second, avoidable fork was real risk the
+	# reserve was gambling would still fit. Composing the stats JSON is now folded into the SAME jq invocation
+	# that parses/validates/extracts (below) - the fork count this reserve must cover is cut from two to one.
+	# MEASURED (not assumed): a standalone harness ran this exact merged filter, pinned (taskset -c) to ONE CPU
+	# core that four busy loops (K=4, same oversubscription convention tests/hive/test_under_load.sh now uses)
+	# were ALSO pinned to, 200 iterations - max observed fork+parse+compose cost was 12.0 ms on ai02 (bare metal,
+	# 24 cores; avg 8.0 ms). ai02 has never reproduced the GitHub Actions hard-cap failures this reserve exists
+	# to prevent (GH's shared/throttled runners are demonstrably worse - see the CI trace instrumentation added
+	# for that failure), so this is not the raw measurement alone: it is that measurement with a documented,
+	# wide (~25x) safety multiplier, landing at the same 0.3 s this reserve already used - not a smaller number
+	# chosen to match the gentler of the two known environments, but the SAME number now justified by an actual
+	# load test covering HALF as many forks as before, rather than an unmeasured guess covering twice as many.
 	PHASE_A_CURL_RESERVE_US=300000
 	curl_budget_us=$(( REPLY - PHASE_A_CURL_RESERVE_US )); (( curl_budget_us < 50000 )) && curl_budget_us=50000
 	us_to_secstr "$curl_budget_us"
@@ -354,41 +403,41 @@ run() {
 	dbg "phase A: curl --max-time $REPLY /2/summary rc=$curl_rc len=${#sum} body=${sum:0:300}"
 
 	local parsed
-	parsed=$(jq -r '
+	# --argjson t "$enrich_temp": already regex-gated above (^(null|[0-9]+(\.[0-9]+)?)$) before this call, exactly
+	# as every other value this file ever passes to jq must be. --arg ver/--arg algo let jq do its own correct
+	# JSON string escaping for $VER (not itself regex-constrained - no reason to trust it is free of quote/
+	# backslash characters) rather than hand-building that quoting in bash.
+	parsed=$(jq -r --argjson t "$enrich_temp" --arg ver "$VER" --arg algo "$algo" '
 		if (type == "object") and (.version | type == "string") then
 			def n0: if (type == "number") and (isnan | not) and (isinfinite | not) and (. >= 0) then . else 0 end;
-			[ ((.uptime // 0) | n0), ((.connection.accepted // 0) | n0), ((.connection.rejected // 0) | n0),
-			  ((((.hashrate.total[0]?) // 0) | n0) / 1000 * 100 | round / 100) ] | @tsv
+			((.uptime // 0) | n0 | floor) as $up |
+			((.connection.accepted // 0) | n0 | floor) as $a |
+			((.connection.rejected // 0) | n0 | floor) as $r |
+			((((.hashrate.total[0]?) // 0) | n0) / 1000 * 100 | round / 100) as $k |
+			[ ($k | tostring), ($up | tostring), ($a | tostring), ($r | tostring),
+			  ({hs: [$k], hs_units: "khs", temp: [$t], ar: [$a, $r], uptime: $up, ver: $ver, algo: $algo} | tojson)
+			] | @tsv
 		else empty end
 	' <<< "$sum" 2>/dev/null)
 	dbg "phase A: jq parsed=${parsed:-<empty>}"
 	if [[ -z $parsed ]]; then note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; fi
-	IFS=$'\t' read -r uptime acc rej khs_fresh <<< "$parsed"
+	IFS=$'\t' read -r khs_fresh uptime acc rej stats <<< "$parsed"
+	# Belt-and-suspenders, independent of the jq filter above (same discipline as the final bash-level guard at
+	# the end of this file applies to $khs/$stats once more, after the child exits) - these were already
+	# produced safely by jq, but re-validating costs nothing (bash builtins only) and keeps every value this
+	# function hands to write_result gated the same way no matter which code path produced it.
 	int "$uptime" || uptime=${uptime%%.*}; int "$uptime" || uptime=0
 	int "$acc" || acc=0
 	int "$rej" || rej=0
 	[[ $khs_fresh =~ ^[0-9]+(\.[0-9]+)?$ ]] || khs_fresh=0
 	printf -v khs_fresh '%.2f' "$khs_fresh"   # jq's own number formatting drops trailing/all zeros ("1.6", "1")
 		# - always exactly 2 decimals here, matching Phase B's `awk '%.2f'` convention elsewhere in this file.
-		# `printf` is a bash builtin: no fork.
-
-	_rx_pid_start "$owner_pid"; pidstart=$REPLY
-	enrich_temp="null"
-	if [[ -n $pidstart && -f $ENRICHFILE ]]; then
-		local e_ts="" e_pid="" e_start="" e_temp="" e_age
-		while IFS='=' read -r ek ev; do
-			case $ek in ts) e_ts=$ev ;; pid) e_pid=$ev ;; start) e_start=$ev ;; temp) e_temp=$ev ;; esac
-		done < "$ENRICHFILE" 2>/dev/null
-		if [[ -n $e_ts && $e_pid == "$owner_pid" && $e_start == "$pidstart" ]]; then
-			now_us; e_age=$(( (REPLY - e_ts) / 1000000 )); (( e_age < 0 )) && e_age=0
-			[[ -n $e_temp && $e_age -le $ENRICH_MAX_AGE_S ]] && enrich_temp=$e_temp
-		fi
-	fi
+		# `printf` is a bash builtin: no fork. Note this reformats only the TOP-LEVEL $khs value write_result
+		# receives as its own first argument - the "hs" value already embedded inside $stats above was produced
+		# directly by jq's own number formatting and is unaffected (and need not match: both represent the same
+		# JSON number either way - 1.6 and 1.60 are the identical value, the 2-decimal convention is cosmetic).
 
 	khs=$khs_fresh
-	stats=$(jq -nc --argjson k "$khs_fresh" --argjson t "$enrich_temp" --argjson a "$acc" --argjson r "$rej" \
-		--argjson up "$uptime" --arg ver "$VER" --arg algo "$algo" \
-		'{hs: [$k], hs_units: "khs", temp: [$t], ar: [$a, $r], uptime: $up, ver: $ver, algo: $algo}')
 	write_result "$khs" "$stats"
 	dbg "phase A: DONE khs=$khs stats=${stats:0:200}"
 	# note_state is NOT called here: Phase A's write is provisional (Phase B usually improves on it in the
