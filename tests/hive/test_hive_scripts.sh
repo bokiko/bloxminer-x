@@ -390,19 +390,27 @@ kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 # ---- failed stats composition: BLOX_HSTATS_TEST_FORCE_STATS_FAIL simulates the transient jq/fork failure
 # class the composition's own validate-before-write guard exists for (see run()'s own header comment) - makes
 # power_raw not valid JSON right before the final --argjson composition, so that jq call fails fatally. Phase
-# A's own already-written result must be left completely untouched, never partially overwritten.
+# A's own already-written result must be left completely untouched, never partially overwritten. $SUM_OK (no
+# hashrate.total -> Phase A's own khs_fresh is 0) rather than a healthy positive summary: Phase A == 0 is
+# ALWAYS treated as consistent with whatever Phase B computes (nothing positive to protect yet), so this
+# reaches the composition step at all (a healthy-but-different Phase A total, e.g. 5 vs BACK_SOME_REAL's own
+# 7, would be rejected by the EARLIER consistency check instead - never reaching composition, which would make
+# this test pass for the wrong reason without ever actually exercising BLOX_HSTATS_TEST_FORCE_STATS_FAIL).
 reset_proc; listen 20034 1034 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
-jq -n --argjson s "$SUM_HEALTHY_5" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
 : > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20034 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
-export BLOX_API_PORT=20034 BLOX_HSTATS_TEST_FORCE_STATS_FAIL=1
+export BLOX_API_PORT=20034 BLOX_HSTATS_TEST_FORCE_STATS_FAIL=1 BLOX_HSTATS_DEBUG_LOG="$T/dbg34.log"
+rm -f "$T/dbg34.log"
 res=$(bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
-unset BLOX_HSTATS_TEST_FORCE_STATS_FAIL
-if [[ $(jq -r '.khs == "5.00" and (.stats.hs | length) == 1 and .stats.hs[0] == 5' <<< "$res" 2>/dev/null) == true ]]; then
+unset BLOX_HSTATS_TEST_FORCE_STATS_FAIL BLOX_HSTATS_DEBUG_LOG
+# Confirms the forced path was actually HIT, not just that the final result happens to look the same as if it
+# had been (e.g. rejected earlier by the consistency check instead) - proves this test exercises what it claims.
+if [[ $(jq -r '.khs == "0.00" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]] && grep -q "FAILED - final stats composition" "$T/dbg34.log" 2>/dev/null; then
 	ok "forced stats-composition failure -> Phase A's already-written result stands untouched"
 else
-	bad "forced stats-composition failure -> Phase A's already-written result stands untouched" "$res"
+	bad "forced stats-composition failure -> Phase A's already-written result stands untouched" "res=$res dbg=$(cat "$T/dbg34.log" 2>/dev/null)"
 fi
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 
@@ -461,8 +469,10 @@ else
 	bad "budget: slow bloxsense capped by the remaining shared budget" "elapsed=${elapsed}s $res"
 fi
 
-# a hanging/very slow API (10 s reply delay): each curl is still capped at its own 0.5 s ceiling (not the
-# whole remaining budget), so this falls back quickly and cleanly (khs 0, hs [0]), well under 3.2 s
+# a hanging/very slow API (10 s reply delay, far longer than the WHOLE 2.4 s collector budget, let alone
+# Phase A's own curl allowance within it): still bounded, never a hang - falls back cleanly (khs 0, hs [0])
+# well under 3.2 s. See the very next case for the property this one is paired with: a DELAY LESS than the
+# remaining budget must NOT be treated the same way (a healthy-but-slow API must still get its real answer).
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" --argjson d 10 '{summary: $s, backends: $b, delay: $d}' > "$T/replies.json"
 : > "$T/api.out"
@@ -476,6 +486,29 @@ if under_budget "$elapsed" && [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< 
 else
 	bad "budget: hanging API falls back under 3.2 s" "elapsed=${elapsed}s $res"
 fi
+
+# ---- P1 (bot review): Phase A's mandatory /2/summary curl used to be capped at a flat 0.5 s ceiling,
+# regardless of how much of the shared 2.4 s budget actually remained - a genuinely healthy XMRig HTTP API
+# under real CPU pressure (its OWN process, not just this file's) can legitimately take well over 500 ms to
+# answer, and that flat ceiling killed the call anyway, reporting a false 0 with most of the budget still
+# unused. A delay comfortably inside the real budget (~1.2 s, well past the OLD 0.5 s ceiling but nowhere
+# close to the 2.4 s collector deadline) must now get its REAL answer, not a false zero - the fix gives this
+# one mandatory call everything that remains, reserving only a small, measured amount for the parse/write
+# that follow it (see h-stats.sh's own PHASE_A_CURL_RESERVE_US comment).
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+jq -n --argjson s "$SUM_HEALTHY_5" --argjson b "$BACK_NULLS" --argjson d 1.2 '{summary: $s, backends: $b, delay: $d}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20038 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+reset_proc; listen 20038 1038 "$BLOX_DIR/xmrig"
+export BLOX_API_PORT=20038
+run_hstats_timed
+if under_budget "$elapsed" && [[ $(jq -r '.khs == "5.00"' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "budget: /2/summary answering after ~1.2 s (past the OLD 0.5 s cap, inside the real budget) still gets its real total (${elapsed}s)"
+else
+	bad "budget: /2/summary answering after ~1.2 s still gets its real total" "elapsed=${elapsed}s $res"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 
 # a LARGE /proc (thousands of fd entries, none matching, plus thousands of stale task entries) together with a
 # hanging API: the /proc ownership scan and the task-mask scan are not individually timed steps - they only
@@ -635,10 +668,21 @@ zres=$(BLOX_DIR=$BLOX_DIR BLOX_PROCFS_ROOT=$PROC BLOX_API_PORT=20037 bash -c '
 	for i in $(seq 1 '"$N_ZPOLLS"'); do
 		. "$BLOX_DIR/h-stats.sh"
 	done
-	children=$(cat /proc/$$/task/$$/children 2>/dev/null)
+	# /proc/<pid>/task/<tid>/children needs CONFIG_CHECKPOINT_RESTORE (not universal - e.g. some container
+	# runtimes/kernels do not expose it): explicitly distinguish "unreadable" from "readable and empty" so the
+	# outer test can SKIP the child-count half of this assertion rather than silently treating a missing file
+	# the same as zero children (which would prove nothing, not pass for a real reason).
+	if [[ -r /proc/$$/task/$$/children ]]; then
+		children=$(cat /proc/$$/task/$$/children 2>/dev/null)
+		children_readable=1
+	else
+		children=""
+		children_readable=0
+	fi
 	fd_after=$(ls /proc/$$/fd 2>/dev/null | wc -l)
-	echo "children=[$children] fd_before=$fd_before fd_after=$fd_after"
+	echo "children_readable=$children_readable children=[$children] fd_before=$fd_before fd_after=$fd_after"
 ')
+children_readable=$(sed -n 's/^children_readable=\([01]\).*/\1/p' <<< "$zres")
 nchildren=$(sed -n 's/.*children=\[\(.*\)\] fd_before.*/\1/p' <<< "$zres" | wc -w | tr -d '[:space:]')
 fd_before=$(sed -n 's/.*fd_before=\([0-9]*\).*/\1/p' <<< "$zres")
 fd_after=$(sed -n 's/.*fd_after=\([0-9]*\).*/\1/p' <<< "$zres")
@@ -646,9 +690,15 @@ fd_after=$(sed -n 's/.*fd_after=\([0-9]*\).*/\1/p' <<< "$zres")
 # transiently differ by a file descriptor or two depending on exactly when bash's own internal housekeeping
 # runs, with no bearing on whether a REAL per-poll fd leak exists (that would grow roughly linearly with
 # N_ZPOLLS=5, not stay within a small constant).
-if [[ $nchildren =~ ^[0-9]+$ && $nchildren -le 1 ]] && [[ $fd_before =~ ^[0-9]+$ && $fd_after =~ ^[0-9]+$ ]] \
-	&& (( fd_after <= fd_before + 2 ))
-then
+fd_ok=0
+[[ $fd_before =~ ^[0-9]+$ && $fd_after =~ ^[0-9]+$ ]] && (( fd_after <= fd_before + 2 )) && fd_ok=1
+if [[ $children_readable == 0 ]]; then
+	if (( fd_ok )); then
+		ok "zombie accumulation: /proc/\$\$/task/\$\$/children not readable here (CONFIG_CHECKPOINT_RESTORE off?) - SKIPPED child-count check, fd count still stable (fd $fd_before->$fd_after)"
+	else
+		bad "zombie accumulation: fd count stable (child-count check skipped - /proc/\$\$/task/\$\$/children not readable here)" "raw=[$zres] fd_before=$fd_before fd_after=$fd_after"
+	fi
+elif [[ $nchildren =~ ^[0-9]+$ && $nchildren -le 1 ]] && (( fd_ok )); then
 	ok "zombie accumulation: <= 1 unreaped child after $N_ZPOLLS forced-escalation polls in one sourced shell, fd count stable (children=$nchildren fd $fd_before->$fd_after)"
 else
 	bad "zombie accumulation: <= 1 unreaped child after $N_ZPOLLS forced-escalation polls in one sourced shell, fd count stable" "raw=[$zres] children=$nchildren fd_before=$fd_before fd_after=$fd_after"
@@ -755,7 +805,13 @@ if [[ $(loglines "stats API unavailable") == 1 ]]; then ok "state log: repeated 
 
 reset_proc; listen 20021 1021 "$PKG2/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
-jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
+# BACK_SOME_REAL (complete, no nulls), not BACK_NULLS: a P2 fix (bot review) now defers note_state ok/
+# unverified until Phase B's result is actually ACCEPTED - BACK_NULLS is deliberately INCOMPLETE (that is the
+# whole point of the dedicated "healthy summary + backends with a null thread rate" case elsewhere in this
+# file), so it would be correctly REJECTED here too (state -> shallow, not ok), never reaching "recovered" at
+# all. This section is testing accepted-path LOGGING specifically, so it needs a fixture Phase B actually
+# accepts; ports 20022/20023 below reuse this SAME $T/replies.json (they write no fixture of their own).
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
 : > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20021 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 run_pkg2 20021   # recovered: verified per-core rows again
@@ -782,6 +838,73 @@ if grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} bloxminer-x:
 else
 	bad "state log: each line is timestamped" "$(cat "$LOG2" 2>/dev/null)"
 fi
+
+# ---- P2 (bot review): note_state used to be called for Phase B's OWN attempted path (ok/unverified) before
+# completeness/consistency were even checked - a REJECTED Phase B result still logged "recovered"/showed the
+# wrong state, even though Phase A's own total was what actually shipped. Each of the three distinct rejection
+# reasons (incomplete rows, >10% mismatch with Phase A, and a failed final composition) must leave the state
+# as "shallow" (the SAME state Phase A's own early exits already use for "total only, no per-core breakdown"),
+# and the transition log line must appear only on a REAL transition - not on every poll that happens to land
+# on "shallow" for a DIFFERENT underlying reason than the previous one.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+rm -rf "$STATE2" "$T/log2"; mkdir -p "$T/log2"
+
+reset_proc; listen 20039 1039 "$PKG2/xmrig"
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20039 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+run_pkg2 20039   # incomplete (null thread rate) -> rejected -> shallow, logged (first-ever transition)
+if [[ $(cat "$STATE2/.bloxminer-x-hstats-state" 2>/dev/null) == shallow && $(loglines "showing total only this poll") == 1 ]]; then
+	ok "state log: incomplete Phase B -> state is shallow, logged once"
+else
+	bad "state log: incomplete Phase B -> state is shallow, logged once" "state=$(cat "$STATE2/.bloxminer-x-hstats-state" 2>/dev/null) $(cat "$LOG2" 2>/dev/null)"
+fi
+run_pkg2 20039   # same incomplete condition again -> still shallow -> NOT re-logged
+if [[ $(loglines "showing total only this poll") == 1 ]]; then ok "state log: repeated incomplete Phase B is not re-logged"; else bad "state log: repeated incomplete Phase B is not re-logged" "$(cat "$LOG2" 2>/dev/null)"; fi
+
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc; listen 20040 1040 "$PKG2/xmrig"
+jq -n --argjson s "$SUM_HEALTHY_50" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20040 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+run_pkg2 20040   # complete but >10% mismatch with Phase A -> rejected -> still shallow, same state as before
+	# -> NOT re-logged (shallow -> shallow is not a transition, even though the REASON differs)
+if [[ $(cat "$STATE2/.bloxminer-x-hstats-state" 2>/dev/null) == shallow && $(loglines "showing total only this poll") == 1 ]]; then
+	ok "state log: >10% Phase A/B mismatch -> state is shallow, no new log line (same state as before)"
+else
+	bad "state log: >10% Phase A/B mismatch -> state is shallow, no new log line" "state=$(cat "$STATE2/.bloxminer-x-hstats-state" 2>/dev/null) $(cat "$LOG2" 2>/dev/null)"
+fi
+
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc; listen 20041 1041 "$PKG2/xmrig"
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20041 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+BLOX_DIR=$PKG2 BLOX_STATE_DIR=$STATE2 BLOX_API_PORT=20041 BLOX_PROCFS_ROOT=$PROC BLOX_HSTATS_TEST_FORCE_STATS_FAIL=1 \
+	bash -c '. "$BLOX_DIR/h-stats.sh"' > /dev/null 2>&1   # SUM_OK (khs_fresh=0) is auto-consistent, so this
+		# reaches the composition step at all before being force-failed there - see the dedicated composition-
+		# failure test above for why a healthy-but-different Phase A total would never reach it in the first place
+if [[ $(cat "$STATE2/.bloxminer-x-hstats-state" 2>/dev/null) == shallow && $(loglines "showing total only this poll") == 1 ]]; then
+	ok "state log: failed stats composition -> state is shallow, no new log line (same state as before)"
+else
+	bad "state log: failed stats composition -> state is shallow, no new log line" "state=$(cat "$STATE2/.bloxminer-x-hstats-state" 2>/dev/null) $(cat "$LOG2" 2>/dev/null)"
+fi
+
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc; listen 20042 1042 "$PKG2/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+jq -n --argjson s "$SUM_OK" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20042 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+run_pkg2 20042   # complete, consistent (Phase A==0, auto), composition succeeds, percore verified -> ACCEPTED
+	# -> state becomes ok, logged exactly once (the first "recovered" transition anywhere in this fresh section)
+if [[ $(cat "$STATE2/.bloxminer-x-hstats-state" 2>/dev/null) == ok && $(loglines "recovered") == 1 ]]; then
+	ok "state log: accepted Phase B (percore) -> state is ok, recovery logged exactly once"
+else
+	bad "state log: accepted Phase B (percore) -> state is ok, recovery logged exactly once" "state=$(cat "$STATE2/.bloxminer-x-hstats-state" 2>/dev/null) $(cat "$LOG2" 2>/dev/null)"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+bloxsense_says "$(fake_topo_json 4)"
 
 # ---- XMRig's own log file is written at XMRig's own tracked offset with no O_APPEND (FileLogWriter), so
 #      anything else appended there is silently overwritten by XMRig's next write - confirmed on a live rig

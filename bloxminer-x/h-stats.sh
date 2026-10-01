@@ -302,7 +302,7 @@ valid_backends() {
 run() {
 	local port_hex inode owner_pid owned fd_dir sum uptime acc rej khs_fresh pidstart enrich_temp
 	local back threads naff sense pkg_temp power_raw percore task_set api_set rows
-	local exe_link curl_rc
+	local exe_link curl_rc PHASE_A_CURL_RESERVE_US curl_budget_us
 
 	remaining_us; dbg "run() entry: remaining_us=$REPLY"
 	have_budget_us "$REPLY" || { dbg "run() entry: OUT OF BUDGET before even the ownership check"; note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; }
@@ -336,7 +336,20 @@ run() {
 	# matters, so this phase forks only what curl/find/awk/readlink/jq themselves cannot be done without.
 	remaining_us; dbg "phase A: entry remaining_us=$REPLY"
 	have_budget_us "$REPLY" || { dbg "phase A: OUT OF BUDGET before the curl call"; note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; }
-	cap_us "$REPLY" 500000; us_to_secstr "$REPLY"   # 0.5 s ceiling
+	# This curl is the ONE mandatory step every poll needs - unlike Phase B's OPTIONAL steps below (each capped
+	# at a flat, small ceiling, since skipping any of THEM is always a safe fallback to Phase A's own total),
+	# killing this call early has no such safe fallback: it is how Phase A gets its answer at all. A P1 finding
+	# (bot review): a flat 0.5 s ceiling here killed a healthy-but-slow XMRig HTTP API under genuine CPU
+	# pressure (its own process, not just this one - a real cause of false zeros even with most of the 2.4 s
+	# budget still unused) - the SAME lesson this file's own fork-free design already learned elsewhere (a cap
+	# chosen to assume the worst, rather than derived from what is actually left, kills an honest-but-slow
+	# answer for no reason). PHASE_A_CURL_RESERVE_US is SUBTRACTED from whatever remains, never a flat ceiling
+	# against it: a measured, generous bound for the one jq parse and one write_result call still needed once
+	# this curl returns (0.3 s - comfortably above either even under full CPU saturation: one jq fork, and
+	# write_result is a plain printf+mv with no fork of its own).
+	PHASE_A_CURL_RESERVE_US=300000
+	curl_budget_us=$(( REPLY - PHASE_A_CURL_RESERVE_US )); (( curl_budget_us < 50000 )) && curl_budget_us=50000
+	us_to_secstr "$curl_budget_us"
 	sum=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/summary" 2>/dev/null); curl_rc=$?
 	dbg "phase A: curl --max-time $REPLY /2/summary rc=$curl_rc len=${#sum} body=${sum:0:300}"
 
@@ -476,8 +489,15 @@ run() {
 	# AND the two totals agree on hashing-or-not: a complete-but-zero Phase B total contradicting a positive
 	# Phase A total is exactly the false-zero a null-as-0 row would quietly outvote a real, fresh, positive
 	# summary rate with - so it is treated as inconsistent, not as a fresher answer.
+	# P2 (bot review): note_state used to be called HERE, unconditionally, before completeness/consistency were
+	# even known below - a REJECTED Phase B result (incomplete, inconsistent with Phase A, or a failed final
+	# composition) still logged "recovered"/"per-thread rows", even though the data behind that message was
+	# about to be discarded and Phase A's own single-row total shipped instead. The state file (and its one-
+	# time-per-transition log line) must describe what was actually ACCEPTED, not what was merely attempted -
+	# deferred below, to right after write_result's own success is known, with a REJECTED outcome logged as
+	# "shallow" (this poll's own answer IS just the total, same as Phase A settling for its own answer earlier
+	# in this file) rather than silently keeping whatever note_state last happened to say.
 	if (( percore )); then
-		note_state ok
 		rows=$(jq -c --argjson s "$sense" '
 			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite)) then null elif $r < 0 then 0 else $r end;
 			($s.cpus | map({key: (.cpu | tostring), value: {pkg: .pkg, core: .core, temp: .temp}}) | from_entries) as $topo
@@ -488,7 +508,6 @@ run() {
 				| if any($rates[]; . == null) then {khs: null, temp: .[0].pc.temp}
 				  else {khs: ((map(.r0 / 1000) | add) * 100 | round / 100), temp: .[0].pc.temp} end)' <<< "$threads")
 	else
-		note_state unverified
 		rows=$(jq -c --argjson pt "$pkg_temp" '
 			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite)) then null elif $r < 0 then 0 else $r end;
 			map(rate0 as $r0 | if $r0 == null then {khs: null, temp: $pt} else {khs: (($r0 / 1000) * 100 | round / 100), temp: $pt} end)' <<< "$threads")
@@ -568,11 +587,24 @@ run() {
 		then
 			khs=$phaseb_total
 			stats=$new_stats
-			write_result "$khs" "$stats"
+			if write_result "$khs" "$stats"; then
+				# Accepted for real: this poll's answer ON DISK ($OUTFILE) is now Phase B's - only now is it
+				# correct to say so. percore here is the SAME value the rows above were grouped by; nothing
+				# between there and here can have changed it.
+				if (( percore )); then note_state ok; else note_state unverified; fi
+			else
+				dbg "phase B: write_result FAILED - Phase A's khs=$khs_fresh stands on disk (OUTFILE unchanged), though in-process \$khs/\$stats now hold the rejected Phase B values - harmless, nothing reads those again before this function returns, and the PARENT only ever reads \$OUTFILE back"
+				note_state shallow
+			fi
 		else
 			dbg "phase B: FAILED - final stats composition invalid/empty (was: '$new_stats') - Phase A's khs=$khs_fresh stands, OUTFILE left untouched"
+			note_state shallow
 		fi
-	fi   # else: Phase A's already-written result (khs_fresh + its own stats) stands, completely untouched
+	else
+		note_state shallow   # incomplete rows, or inconsistent with Phase A - Phase A's own total stands,
+			# completely untouched; this poll's REAL answer is "total only", not "per-core"/"per-thread"
+	fi   # else (the composition if/else above): Phase A's already-written result (khs_fresh + its own stats)
+	     # stands, completely untouched
 
 	# enrichment cache: TEMPERATURE only, keyed by this xmrig instance (pid + its own /proc start time) - see
 	# the file header. Never khs.
