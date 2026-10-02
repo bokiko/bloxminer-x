@@ -111,7 +111,10 @@ PROC=${BLOX_PROCFS_ROOT:-/proc}          # /proc path prefix; tests only
 PKG=${BLOX_DIR:-/hive/miners/custom/bloxminer-x}
 PORT=${BLOX_API_PORT:-${API_PORT:-4069}}
 VER="bloxminer-x $CUSTOM_VERSION (xmrig 6.26.0)"
-algo=$(jq -r '.pools[0].algo // empty' "$CUSTOM_CONFIG_FILENAME" 2>/dev/null)
+# `|| true`: errexit-safe (see the OUTFILE result= line, far below, for the full rationale this file applies
+# consistently) - a missing/corrupt config.json or a transient jq failure must fall through to the very next
+# line's regex-and-default, never take the whole sourcing caller down with it.
+algo=$(jq -r '.pools[0].algo // empty' "$CUSTOM_CONFIG_FILENAME" 2>/dev/null) || true
 # Validated against the exact shape h-config.sh's own ALGOS list allows (rx/0, rx/wow, rx/arq, rx/graft,
 # rx/sfx, rx/yada) rather than trusted as-is: config.json is normally written by our OWN h-config.sh, which
 # already validates against that list, but this file reads it back independently and must not assume that
@@ -196,7 +199,17 @@ remaining_us() {   # sets $REPLY = microseconds left until the ONE absolute $DEA
 	# "now" partway through, which would silently grant extra time on top of what was already spent.
 	local n; now_us; n=$REPLY
 	REPLY=$(( DEADLINE_US - n ))
-	(( REPLY < 0 )) && REPLY=0
+	# `|| true`: errexit-safe - this function is called bare (no `if`/`&&`/`||` around it) almost everywhere in
+	# this file, purely for its $REPLY side effect, with no caller ever checking its own return status. Without
+	# this, its WHOLE RETURN VALUE is whatever `(( REPLY < 0 )) && REPLY=0` happens to evaluate to - which is
+	# FALSE (1) on every call where there is still real budget left (REPLY >= 0, the common/healthy case) and
+	# only true (0) once time has actually run out. A bare call to a function whose own last command fails is
+	# NOT exempt from `set -e` the way the identical `(( )) && ...` pattern written directly inline would be
+	# (verified directly: inlined, it is exempt - wrapped in a function and called bare, it is not) - so
+	# WITHOUT this fix, sourcing this file into any `set -e` caller would abort on the very FIRST healthy poll,
+	# at this exact line, every single time. See the OUTFILE result= line, far below, for the full policy this
+	# file applies consistently to every other command whose failure is a normal possibility.
+	(( REPLY < 0 )) && REPLY=0 || true
 }
 have_budget_us() { (( $1 > 50000 )); }   # < 50 ms left is not worth attempting
 cap_us() { (( $1 < $2 )) && REPLY=$1 || REPLY=$2; }   # min(remaining, nominal per-step ceiling), both in us
@@ -228,14 +241,22 @@ us_to_secstr() {   # $1 = microseconds -> $REPLY = "S.ffffff", for curl --max-ti
 # -t itself ever working, not just that -t usually does.
 wait_secs() {
 	local fd=$1 secs=$2
+	# `|| true` on every branch below, not just the bare trailing `true` this function already ended with:
+	# errexit-safe (OUTFILE result= further down has the full policy) - this function is called BARE on
+	# every single poll-loop iteration, so its own internal `read`/`sleep` returning non-zero (`-t` actually
+	# firing - the NORMAL, expected way this unblocks - or a real EOF/signal) is not exempt just because a
+	# trailing `true` comes after it: that later `true` can only protect the function's OWN RETURN VALUE once
+	# bash reaches it, and under errexit a bare failing statement aborts THERE, before ever reaching it. Found
+	# directly: a `set -e` caller aborted on the very FIRST poll-loop iteration, at this exact function, before
+	# any `set -e`-specific test existed for it - proof this exact fix is load-bearing, not defensive-only.
 	if (( fd >= 0 )); then
 		if [[ -n ${BLOX_HSTATS_TEST_NO_TIMEOUT:-} ]]; then
-			read -r -N 1 -u "$fd" _ 2>/dev/null
+			read -r -N 1 -u "$fd" _ 2>/dev/null || true
 		else
-			read -r -t "$secs" -N 1 -u "$fd" _ 2>/dev/null
+			read -r -t "$secs" -N 1 -u "$fd" _ 2>/dev/null || true
 		fi
 	else
-		sleep "$secs" 2>/dev/null
+		sleep "$secs" 2>/dev/null || true
 	fi
 	true
 }
@@ -278,8 +299,13 @@ note_state() {   # $1 = ok | unverified | shallow | unavailable; logs only on a 
                  # tracked offset with no O_APPEND, so anything else appended there is silently overwritten by
                  # XMRig's next write). Own file instead: $CUSTOM_LOG_BASENAME.stats.log, timestamped, bounded
                  # to ~200 lines.
+	# errexit-safe throughout (see the OUTFILE result= line, far below, for the full policy): this function is
+	# ALWAYS called bare (fire-and-forget logging - no caller anywhere checks its return value), so every
+	# statement below that touches a file (STATEFILE/the stats log) must survive a normal I/O hiccup
+	# (permissions, a full disk, a race) on its own - an unguarded failure here would otherwise take the whole
+	# sourcing caller down with it over what is, for this function's own purpose, a cosmetic logging miss.
 	local prev="" cur=$1 msg="" statslog="$CUSTOM_LOG_BASENAME.stats.log" sz
-	[[ -f $STATEFILE ]] && prev=$(<"$STATEFILE")
+	[[ -f $STATEFILE ]] && { prev=$(<"$STATEFILE") || true; }
 	[[ $prev == "$cur" ]] && return 0
 	case $cur in
 		unavailable) msg="bloxminer-x: stats API unavailable" ;;
@@ -291,12 +317,12 @@ note_state() {   # $1 = ok | unverified | shallow | unavailable; logs only on a 
 		{
 			sz=$(wc -c < "$statslog" 2>/dev/null | tr -d '[:space:]'); [[ $sz =~ ^[0-9]+$ ]] || sz=0
 			if (( sz > 1048576 )); then
-				tail -n 200 "$statslog" > "$statslog.tmp" 2>/dev/null && mv -f "$statslog.tmp" "$statslog"
+				tail -n 200 "$statslog" > "$statslog.tmp" 2>/dev/null && mv -f "$statslog.tmp" "$statslog" || true
 			fi
-			printf '%s %s\n' "$(date '+%F %T')" "$msg" >> "$statslog"
+			printf '%s %s\n' "$(date '+%F %T')" "$msg" >> "$statslog" || true
 		} 2>/dev/null
 	fi
-	{ printf '%s' "$cur" > "$STATEFILE"; } 2>/dev/null
+	{ printf '%s' "$cur" > "$STATEFILE"; } 2>/dev/null || true
 }
 
 fallback() {   # $1 = a single row's temperature (bloxsense pkg_temp, JSON number or the literal "null"), default
@@ -367,10 +393,10 @@ run() {
 	local back threads naff sense pkg_temp power_raw percore task_set api_set rows
 	local parsed_back gate_out gate_ok rows_out hs_json temp_json
 	local sense_fresh_read sense_valid sense_raw sense_ts_line sense_ts sense_age
-	local exe_link curl_rc PHASE_A_CURL_RESERVE_US curl_budget_us
+	local exe_link curl_rc bloxsense_rc PHASE_A_CURL_RESERVE_US curl_budget_us
 
 	remaining_us; dbg "run() entry: remaining_us=$REPLY"
-	have_budget_us "$REPLY" || { dbg "run() entry: OUT OF BUDGET before even the ownership check"; note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; }
+	have_budget_us "$REPLY" || { dbg "run() entry: OUT OF BUDGET before even the ownership check"; note_state unavailable; fallback ""; write_result "$khs" "$stats" || true; return 0; }
 
 	# ---- API ownership: /proc/net/tcp -> inode -> pid -> exe (the whole scan is inside the timed child)
 	port_hex=$(printf '%04X' "$PORT")
@@ -388,11 +414,13 @@ run() {
 	fi
 	owned=0; exe_link=""
 	if [[ -n $owner_pid ]]; then
-		exe_link=$(readlink "$PROC/$owner_pid/exe" 2>/dev/null)
+		exe_link=$(readlink "$PROC/$owner_pid/exe" 2>/dev/null) || true   # errexit-safe (OUTFILE result=
+			# below has the full policy): the owner pid can legitimately have exited between the /proc scan
+			# above and this readlink (a TOCTOU race), which is just "not owned" - not worth losing the poll.
 		[[ $exe_link == "$PKG/xmrig" ]] && owned=1
 	fi
 	dbg "ownership: PORT=$PORT port_hex=$port_hex inode=${inode:-<none>} owner_pid=${owner_pid:-<none>} exe_link=${exe_link:-<none>} expected=$PKG/xmrig owned=$owned"
-	if (( ! owned )); then note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; fi
+	if (( ! owned )); then note_state unavailable; fallback ""; write_result "$khs" "$stats" || true; return 0; fi
 
 	# ---- cached temperature lookup (pid+starttime keyed) - done HERE, before Phase A's curl/parse below, not
 	# after: it depends only on $owner_pid (already known above), never on anything the curl/jq parse produces,
@@ -435,7 +463,7 @@ run() {
 	# readlink/jq themselves cannot be done without; everything that does NOT need the curl's response (the
 	# cached-temperature lookup above) is deliberately done BEFORE this point for the same reason.
 	remaining_us; dbg "phase A: entry remaining_us=$REPLY"
-	have_budget_us "$REPLY" || { dbg "phase A: OUT OF BUDGET before the curl call"; note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; }
+	have_budget_us "$REPLY" || { dbg "phase A: OUT OF BUDGET before the curl call"; note_state unavailable; fallback ""; write_result "$khs" "$stats" || true; return 0; }
 	# This curl is the ONE mandatory step every poll needs - unlike Phase B's OPTIONAL steps below (each capped
 	# at a flat, small ceiling, since skipping any of THEM is always a safe fallback to Phase A's own total),
 	# killing this call early has no such safe fallback: it is how Phase A gets its answer at all. A P1 finding
@@ -467,7 +495,12 @@ run() {
 	PHASE_A_CURL_RESERVE_US=100000
 	curl_budget_us=$(( REPLY - PHASE_A_CURL_RESERVE_US )); (( curl_budget_us < 50000 )) && curl_budget_us=50000
 	us_to_secstr "$curl_budget_us"
-	sum=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/summary" 2>/dev/null); curl_rc=$?
+	# `&& curl_rc=0 || curl_rc=$?`, not a bare `; curl_rc=$?`: errexit-safe (OUTFILE result= below has the
+	# full policy) while still capturing curl's REAL exit code for the dbg line right after - curl failing
+	# (API down/slow, the exact scenario this whole phase exists to handle) is a left-side-of-&& "test" bash
+	# already exempts from errexit, so this is also the minimal fix, not just a `|| true` that would have
+	# thrown away curl_rc's own diagnostic value.
+	sum=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/summary" 2>/dev/null) && curl_rc=0 || curl_rc=$?
 	dbg "phase A: curl --max-time $REPLY /2/summary rc=$curl_rc len=${#sum} body=${sum:0:300}"
 
 	local parsed
@@ -486,9 +519,11 @@ run() {
 			  ({hs: [$k], hs_units: "khs", temp: [$t], ar: [$a, $r], uptime: $up, ver: $ver, algo: $algo} | tojson)
 			] | @tsv
 		else empty end
-	' <<< "$sum" 2>/dev/null)
+	' <<< "$sum" 2>/dev/null) || true   # errexit-safe (OUTFILE result= below has the full policy) - a
+		# malformed/non-JSON $sum (e.g. curl above failed, or a foreign/HTML reply) or a transient jq hiccup
+		# must fall through to the very next "if [[ -z $parsed ]]" check, not abort the caller.
 	dbg "phase A: jq parsed=${parsed:-<empty>}"
-	if [[ -z $parsed ]]; then note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; fi
+	if [[ -z $parsed ]]; then note_state unavailable; fallback ""; write_result "$khs" "$stats" || true; return 0; fi
 	IFS=$'\t' read -r khs_fresh uptime acc rej stats <<< "$parsed"
 	# Belt-and-suspenders, independent of the jq filter above (same discipline as the final bash-level guard at
 	# the end of this file applies to $khs/$stats once more, after the child exits) - these were already
@@ -506,7 +541,9 @@ run() {
 		# JSON number either way - 1.6 and 1.60 are the identical value, the 2-decimal convention is cosmetic).
 
 	khs=$khs_fresh
-	write_result "$khs" "$stats"
+	write_result "$khs" "$stats" || true   # errexit-safe, same policy as every other bare write_result() call
+		# in this file - a REFUSED/failed write here is already harmless by design (see write_result's own
+		# header: $OUTFILE is simply left as whatever it was), never worth losing the whole poll over.
 	dbg "phase A: DONE khs=$khs stats=${stats:0:200}"
 	# note_state is NOT called here: Phase A's write is provisional (Phase B usually improves on it in the
 	# very same poll), and logging "shallow" unconditionally on every poll - even ones where Phase B goes on to
@@ -519,7 +556,9 @@ run() {
 	remaining_us; dbg "phase B: entry remaining_us=$REPLY"
 	have_budget_us "$REPLY" || { dbg "phase B: SKIPPED - out of budget, Phase A's khs=$khs stands"; note_state shallow; return 0; }
 	cap_us "$REPLY" 500000; us_to_secstr "$REPLY"
-	back=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/backends" 2>/dev/null); curl_rc=$?
+	back=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/backends" 2>/dev/null) && curl_rc=0 || curl_rc=$?
+		# errexit-safe, same `&& curl_rc=0 || curl_rc=$?` pattern as Phase A's own /2/summary curl above -
+		# preserves the real rc for the dbg line right after instead of just discarding it with a bare `|| true`.
 	dbg "phase B: curl --max-time $REPLY /2/backends rc=$curl_rc len=${#back} body=${back:0:300}"
 	# ONE jq call does validate-shape + thread-extraction + naff together - a CI-trace-measured cost center
 	# (bot review, GH 2-vCPU runner: "naff jq 0.30s") used to be FOUR separate forks: a generic "is this JSON at
@@ -540,7 +579,8 @@ run() {
 		    ))))
 		then ([.[] | select(.type == "cpu") | .threads[]?] // []) as $th | [($th | length), ($th | tojson)] | @tsv
 		else empty end
-	' <<< "$back" 2>/dev/null)
+	' <<< "$back" 2>/dev/null) || true   # errexit-safe (OUTFILE result= below has the full policy) - falls
+		# through to the very next "if [[ -z $parsed_back ]]" check either way, same as Phase A's own parse.
 	if [[ -z $parsed_back ]]; then dbg "phase B: SKIPPED - backends reply not valid JSON/shape, Phase A's khs=$khs stands"; note_state shallow; return 0; fi
 	IFS=$'\t' read -r naff threads <<< "$parsed_back"
 	int "$naff" || naff=0
@@ -561,7 +601,9 @@ run() {
 	remaining_us
 	sense_fresh_read=0; sense=""
 	if [[ -f $SENSEFILE ]]; then
-		sense_raw=$(<"$SENSEFILE")   # bash's own $(<file) fast path - forkless, no cat/subshell exec
+		sense_raw=$(<"$SENSEFILE") || true   # errexit-safe (OUTFILE result= below has the full policy) -
+			# bash's own $(<file) fast path - forkless, no cat/subshell exec; a TOCTOU race (removed/unreadable
+			# between the -f check above and this read) falls through as an empty $sense_raw, same as below.
 		sense_ts_line=${sense_raw%%$'\n'*}
 		sense_ts=${sense_ts_line#ts=}
 		# SECURITY: $sense_ts is file content, not a bash-internal integer - same class of site as ENRICHFILE's
@@ -582,7 +624,12 @@ run() {
 			# SIGTERM could end up in a process group the outer timeout's kill never reaches, and survive as an
 			# orphan.
 			cap_us "$REPLY" 1000000; us_to_secstr "$REPLY"
-			sense=$(timeout --foreground "$REPLY" "$PKG/bloxsense" --json 2>&1); dbg "phase B: bloxsense rc=$? len=${#sense} body=${sense:0:200}"
+			# `&& bloxsense_rc=0 || bloxsense_rc=$?`, not a bare `; dbg "...rc=$?..."`: errexit-safe (OUTFILE
+			# result= below has the full policy) while still capturing the real rc for the dbg line right
+			# after - bloxsense timing out or failing is an EXPECTED outcome this phase already handles
+			# gracefully downstream (sense_valid, below), so the assignment itself must survive it too.
+			sense=$(timeout --foreground "$REPLY" "$PKG/bloxsense" --json 2>&1) && bloxsense_rc=0 || bloxsense_rc=$?
+			dbg "phase B: bloxsense rc=$bloxsense_rc len=${#sense} body=${sense:0:200}"
 			sense_fresh_read=1
 		else
 			note_state shallow; return 0
@@ -636,7 +683,9 @@ run() {
 			if (all(.affinity >= 0) and (map(.affinity as $a | ($s.cpus | any(.cpu == $a))) | all))
 			then "1\t" + ([.[].affinity] | sort | tojson)
 			else "0\t[]" end
-		' <<< "$threads" 2>/dev/null)
+		' <<< "$threads" 2>/dev/null) || true   # errexit-safe (OUTFILE result= below has the full policy) -
+			# a transient jq failure here just means percore stays 0 (gate_ok's own default below), same as
+			# a well-formed "0\t[]" reply would.
 		gate_ok=0; api_set='[]'
 		[[ -n $gate_out ]] && IFS=$'\t' read -r gate_ok api_set <<< "$gate_out"
 		[[ $gate_ok == 1 ]] || { gate_ok=0; api_set='[]'; }
@@ -711,7 +760,9 @@ run() {
 			| ($rows | all(.khs != null)) as $complete
 			| (($rows | map(.khs) | map(select(. != null)) | add // 0)) as $total
 			| [$complete, $total, ($rows | map(.khs) | tojson), ($rows | map(.temp) | tojson), ($rows | tojson)] | @tsv
-		' <<< "$threads" 2>/dev/null)
+		' <<< "$threads" 2>/dev/null) || true   # errexit-safe (OUTFILE result= below has the full policy) -
+			# an empty $rows_out from a transient jq failure is already handled, just below, the same as a
+			# well-formed but empty reply would be.
 	else
 		rows_out=$(jq -r --argjson pt "$pkg_temp" '
 			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite)) then null elif $r < 0 then 0 else $r end;
@@ -719,7 +770,7 @@ run() {
 			| ($rows | all(.khs != null)) as $complete
 			| (($rows | map(.khs) | map(select(. != null)) | add // 0)) as $total
 			| [$complete, $total, ($rows | map(.khs) | tojson), ($rows | map(.temp) | tojson), ($rows | tojson)] | @tsv
-		' <<< "$threads" 2>/dev/null)
+		' <<< "$threads" 2>/dev/null) || true   # errexit-safe, same reasoning as the percore branch above
 	fi
 	complete=false; phaseb_total=""; hs_json=""; temp_json=""; rows=""
 	[[ -n $rows_out ]] && IFS=$'\t' read -r complete phaseb_total hs_json temp_json rows <<< "$rows_out"
@@ -929,7 +980,9 @@ CPID=$!
 # of them signals it directly by PID/PGID via the kernel, bypassing job-control syntax entirely) - disowning it
 # closes the same latent risk class for the SAME reason, before a future timing window (a slower CI runner, a
 # differently-scheduled escalation) makes it land somewhere that corrupts a real result.
-disown "$CPID" 2>/dev/null
+disown "$CPID" 2>/dev/null || true   # errexit-safe (see result= below): a TOCTOU-raced "no such job" is possible
+	# if $CPID already exited and got reaped before this runs - vanishingly rare, but a bare `disown` failing
+	# here is a normal possibility, not a corruption, so it gets the same guard as every other such site.
 # PARENT_PGID: deliberately computed HERE, AFTER backgrounding the child above - not before, as an earlier
 # version of this file did. This fork (`ps`) no longer sits in the serial "poll-entry -> summary-request-sent"
 # critical path at all (another "cheap to cut" startup cost, bot review): it now overlaps with the child's own
@@ -979,7 +1032,7 @@ if (( waitfd >= 0 )); then
 	# still mid-sleep): `disown` removes it from the job table, so no such diagnostic is ever printed, while
 	# `kill -9 -- "-$pid"` against its pgid still works identically afterward - disown only affects bash's OWN
 	# notification bookkeeping, never the kernel-level process/group the PID still refers to.
-	disown "$WATCHDOG_PID" 2>/dev/null
+	disown "$WATCHDOG_PID" 2>/dev/null || true   # errexit-safe, same TOCTOU rationale as $CPID's own disown above
 fi
 
 {
@@ -1044,17 +1097,29 @@ fi
 		# the budget ran out, not the collection itself: escalate against the validated group when one is
 		# available (reaching every descendant, including a nested `timeout --foreground` and whatever it is
 		# guarding), else against $CPID alone - never a guessed or unconfirmed group
-		escalate TERM
+		# `|| true` on both calls below: escalate()'s own builtin `kill` can legitimately fail ("no such
+		# process") if the target already exited between still_running()'s own check and this signal - a race,
+		# not a bug - and a bare function call failing here is errexit-unsafe exactly like result= further down.
+		escalate TERM || true
 		wait_secs "$waitfd" "$KILL_GRACE"
-		still_running && escalate KILL
+		# shellcheck disable=SC2015   # intentional, not the if/then/else mistake this normally flags: $?
+		# right after this line is NEVER read by anything (the function just falls off the end next), so
+		# "escalate KILL" NOT running at all (still_running was false) and "escalate KILL" running but
+		# FAILING are both meant to land on the exact same `|| true` no-op either way.
+		still_running && escalate KILL || true
 	fi
 	# The WATCHDOG's own job is done the instant this poll is - killed by its own pgid (it is setsid'd, so its
 	# pid IS its pgid), unconditionally, whether it already fired both its bytes or is still sleeping toward
 	# either one. Sourced repeatedly in the same long-lived Hive agent shell: a watchdog left running into the
 	# NEXT poll would eventually write a stray byte into that poll's own (freshly re-created) $waitfd - it
 	# cannot, since each poll gets its own $TMPD/$WAITFIFO, but it would still be a needless lingering process.
-	[[ -n $WATCHDOG_PID ]] && kill -9 -- "-$WATCHDOG_PID" 2>/dev/null
-	(( waitfd >= 0 )) && { exec {waitfd}<&-; } 2>/dev/null
+	# `|| true` on both lines below, same reasoning as escalate() above: the WATCHDOG may already have exited
+	# on its own (its own KILL_GRACE sleep elapsing right around when this runs), and closing an fd that is
+	# somehow already closed is the same class of harmless, expected failure - errexit-unsafe otherwise.
+	[[ -n $WATCHDOG_PID ]] && { kill -9 -- "-$WATCHDOG_PID" 2>/dev/null || true; }
+	# shellcheck disable=SC2015   # intentional, same "the `|| true` is the catch-all for either outcome of
+	# the && branch, nothing downstream reads $? either way" reasoning as still_running's own disable above.
+	(( waitfd >= 0 )) && { exec {waitfd}<&-; } 2>/dev/null || true
 	# CI finding (GH Actions, un-throttled ai02 never reproduced it): the read-back used to happen AFTER a
 	# BLOCKING, UNTIMED `wait "$CPID"` right here - SIGKILL kills its target immediately regardless of OUR own
 	# scheduling, but `wait` only returns once THIS shell has itself been scheduled long enough to receive and
@@ -1065,7 +1130,22 @@ fi
 	# reached its own result read-back. $OUTFILE is read HERE, before the reap, specifically so an
 	# already-safely-written answer (at minimum Phase A's own fresh total - see write_result's own atomic
 	# tmp+rename and the file header's Phase A/B design) is never held hostage by how long reaping $CPID takes.
-	result=$(cat "$OUTFILE" 2>/dev/null)
+	# `|| result=""`, not a bare assignment: a bot-review finding (sibling 2.1.1 package) - this file is SOURCED
+	# into Hive's own agent shell, which this file does not control and must not assume anything about,
+	# including whether it runs under `set -e` (errexit). `cat`'s own exit status becomes the WHOLE assignment
+	# statement's exit status (a command-substitution assignment is not magically "always successful" the way
+	# an arithmetic `VAR=$(( expr ))` assignment is) - a missing $OUTFILE (e.g. the deadline already passed
+	# before Phase A ever got to write it, or a delayed handshake) makes `cat` exit non-zero even with its own
+	# error TEXT suppressed by `2>/dev/null`, and under errexit THAT ALONE would kill the long-lived CALLER
+	# (Hive's own agent) right here, before the khs=0 fallback a few lines down ever gets a chance to run -
+	# turning "this one poll reports 0" into "the whole agent process is gone". `|| result=""` makes the
+	# defined, empty-result fallback the assignment's own successful outcome instead, exactly as if nothing had
+	# ever been written - which is already a case the final jq-parse-and-fallback block below handles correctly.
+	# Every OTHER command in this file whose failure is a normal (not corruption/packaging-level) possibility -
+	# a transient jq/curl/fork hiccup, a process already gone when signalled, a disk write that did not land -
+	# was audited and guarded the SAME way; see the shorter `|| true` notes at each of those sites instead of
+	# repeating this explanation everywhere.
+	result=$(cat "$OUTFILE" 2>/dev/null) || result=""
 	# No explicit `wait "$CPID"` at all, deliberately: SIGKILL has already terminated $CPID by this point
 	# (unblockable, immediate, regardless of this shell's own scheduling) - what a trailing `wait` here would
 	# actually be doing is REAPING it (clearing the zombie), a bookkeeping step with no bearing on the answer
@@ -1084,8 +1164,10 @@ fi
 # $result above - no more separate cleanup branches for "the group ran" vs "it couldn't start" (the old P2
 # bot-review fix this replaces): with a single `mktemp -d` allocation (see its own header comment above), there
 # is no longer a partial-success case where only SOME of these three paths exist and need individually
-# guarded removal.
-rm -rf "$TMPD"
+# guarded removal. `|| true`: errexit-safe, same reasoning as result= above - a permission/race hiccup
+# removing a temp dir is a normal possibility (e.g. something inside it still transiently open), never worth
+# losing the already-captured $result over.
+rm -rf "$TMPD" 2>/dev/null || true
 
 # Whatever $OUTFILE holds - Phase A's answer, or Phase B's richer one, or nothing at all if the child was
 # killed before Phase A even finished writing - is used as-is: no cache, no age bound, no re-verification for
@@ -1100,10 +1182,14 @@ rm -rf "$TMPD"
 # expected shape (an object with an "hs" array) - a nonempty-string guard alone would accept
 # {"khs":"abc","stats":null} (both "abc" and jq's own stringified "null" are nonempty strings) as if they were
 # real, honest answers.
+# `|| true`: errexit-safe, same reasoning as result= above - a transient jq fork/exec failure (or, in
+# principle, a jq version whose exit status for this empty/falsy-filter shape differs - see the jq 1.6-vs-1.7
+# `-e` note elsewhere in this file, though this call never uses `-e`) must fall through to the unconditional
+# guard right below, never take the whole caller down with it.
 parsed=$(jq -r '
 	if (type == "object") and (.khs | type) == "string" and (.khs | test("^[0-9]+(\\.[0-9]+)?$"))
 	   and (.stats | type) == "object" and ((.stats.hs | type) == "array")
-	then [.khs, (.stats | tojson)] | @tsv else empty end' <<< "$result" 2>/dev/null)
+	then [.khs, (.stats | tojson)] | @tsv else empty end' <<< "$result" 2>/dev/null) || true
 if [[ -n $parsed ]]; then
 	IFS=$'\t' read -r khs stats <<< "$parsed"
 fi

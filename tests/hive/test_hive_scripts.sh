@@ -1244,5 +1244,53 @@ fi
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 jq -n '{pools: [{algo: "rx/0"}]}' > "$CONF"   # restore - later tests in this file expect the normal config
 
+# ---- errexit (set -e) SAFETY: a bot-review finding (sibling 2.1.1 PR) that applies here too -
+# bloxminer-x/h-stats.sh:1068's own `result=$(cat "$OUTFILE" 2>/dev/null)` (now `|| result=""`, see its own
+# header comment) is just the FIRST of this file's own, now-audited set of "normal fallback path" commands
+# whose failure must never abort the CALLER: this file is SOURCED into Hive's own agent shell, which it does
+# not control and must not assume anything about, including whether that shell runs under `set -e`. Two
+# scenarios, both run through a bash -c that itself sets -e (making the sourced file's own top-level commands
+# subject to the SAME errexit the real Hive agent might have):
+#   1. $OUTFILE genuinely never gets created at all - BLOX_HSTATS_TEST_HANDSHAKE_DELAY (the SAME test-only hook
+#      the "process-group isolation" case above already uses, just far longer: 10s, comfortably past
+#      BUDGET_US+KILL_GRACE's 2.7s) sleeps the collector BEFORE it ever reaches `run()`, so it is SIGKILLed by
+#      the escalation while still in that sleep - write_result() is never called even once, unlike a slow-API
+#      case (curl's own --max-time would return early and let write_result() write the normal "0" fallback,
+#      which would NOT exercise this specific line: $OUTFILE would exist). Confirmed directly (manual run
+#      instrumented with BLOX_HSTATS_DEBUG_LOG): $TMPD holds only lib/waitfifo, never hs/out, right up until
+#      the whole dir is removed.
+#   2. an ordinary healthy poll (positive khs) - proving the fix does not just move the hazard to a DIFFERENT
+#      line that only a slow/failing poll would ever reach.
+# In BOTH, the test asserts: the inner `bash -c 'set -e; ...'` itself exits 0 (never aborted early) AND $khs
+# came back as the expected value - not just one or the other, since a caller that "survives" but never
+# actually got a real answer would be just as broken in practice.
+reset_proc; listen 20048 1148 "$BLOX_DIR/xmrig"
+# shellcheck disable=SC2016   # $BLOX_DIR/$khs expand in the inner bash -c, not here
+res_noout=$(BLOX_DIR=$BLOX_DIR BLOX_HSTATS_TEST_HANDSHAKE_DELAY=10 timeout 5 bash -c 'set -e; . "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+rc_noout=$?
+if [[ $rc_noout == 0 ]] && [[ $res_noout == "khs=[0]" ]]; then
+	ok "set -e caller survives: \$OUTFILE never created (collector killed before run() even starts) -> khs=0"
+else
+	bad "set -e caller survives: \$OUTFILE never created (collector killed before run() even starts) -> khs=0" \
+		"rc=$rc_noout res=[$res_noout]"
+fi
+
+reset_proc; listen 20049 1149 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+SUM_ERREXIT_HEALTHY=$(jq -nc '{uptime: 321, connection: {accepted: 15, rejected: 1}, algo: "rx/0", version: "6.26.0", hashrate: {total: [4000.0]}}')
+jq -n --argjson s "$SUM_ERREXIT_HEALTHY" --argjson b "$BACK_SOME_REAL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20049 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+# shellcheck disable=SC2016   # $BLOX_DIR/$khs expand in the inner bash -c, not here
+res_healthy=$(BLOX_DIR=$BLOX_DIR BLOX_API_PORT=20049 timeout 5 bash -c 'set -e; . "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+rc_healthy=$?
+if [[ $rc_healthy == 0 ]] && [[ $res_healthy == "khs=[4.00]" ]]; then
+	ok "set -e caller survives: healthy poll -> khs=4.00, same as without set -e"
+else
+	bad "set -e caller survives: healthy poll -> khs=4.00, same as without set -e" "rc=$rc_healthy res=[$res_healthy]"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+bloxsense_says "$(fake_topo_json 4)"
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
