@@ -24,8 +24,11 @@ BloxMiner-X's `h-stats.sh` reads XMRig's own local HTTP API (`/2/summary`, `/2/b
   seconds of hashing actually stopping, and is not a "completed work" timestamp.
 - If XMRig's API cannot be reached, or the socket on the configured port belongs to a different process (not
   this package's own `xmrig`), stats report 0 rather than showing another miner's numbers.
-- The whole `h-stats.sh` run shares one 3-second deadline; whatever a step (an API call, the sensor helper)
-  cannot finish within what is left of that budget is skipped, and the run falls back rather than risk overrunning.
+- The whole `h-stats.sh` run shares one 3-second deadline. The hashrate total is always answered from a single,
+  cheap `/2/summary` call first (Phase A); the richer per-core/per-thread breakdown (`/2/backends` plus
+  `bloxsense`, Phase B) only replaces it when it finishes in time AND its own total agrees with Phase A's -
+  so a slow poll under heavy load degrades to "total only, no per-core breakdown" rather than ever reporting a
+  false 0 when XMRig is actually hashing.
 - State changes (API unavailable, affinity mapping not verified, recovered) get one timestamped line each,
   never on stdout, in a separate file next to the miner log: `<CUSTOM_LOG_BASENAME>.stats.log` (bounded to its
   last ~200 lines past 1 MiB). They are never written into XMRig's own log file: XMRig's `FileLogWriter` opens
@@ -67,14 +70,31 @@ to steer XMRig's own thread autoconfiguration, or `"randomx": {"rdmsr": false}`.
 `"1gb-pages": true` is also accepted nested as `"randomx": {"1gb-pages": true}` - both forms go through the
 same NUMA-memory gate, so there is no way to set it unchecked.
 
-**Limitation (1.0.0):** the pool list is always exactly the one flight-sheet pool; Extra config cannot add a
-failover/backup pool via a `"pools"` array (any `"pools"` in Extra config is ignored) - the same limitation as
-the Verus BloxMiner.
+**Limitation (since 1.0.0):** the pool list is always exactly the one flight-sheet pool; Extra config cannot add
+a failover/backup pool via a `"pools"` array (any `"pools"` in Extra config is ignored) - the same limitation
+as the Verus BloxMiner.
 
 ## Requirements
 
 - x86-64 CPU with AES-NI (RandomX needs AES acceleration). `h-run.sh` refuses to start otherwise.
 - Root (Hive runs the miner as root already; XMRig applies the MSR mod and huge pages as root on Linux).
+
+## Switching back to Verus
+
+BloxMiner-X calls Hive's own `hugepages -rx` helper (when present) before XMRig starts, and XMRig itself
+reserves 2 MB huge pages as root at startup either way. Neither BloxMiner-X nor XMRig releases that reservation
+when XMRig stops - `vm.nr_hugepages` stays at whatever value it was raised to. There is no ownership tracking
+or automatic restore in this package: switching a rig from BloxMiner-X back to the Verus BloxMiner (or to any
+other miner) is a manual step.
+
+After XMRig has stopped:
+
+1. Check whether anything else on this rig intentionally relies on the current `vm.nr_hugepages` value before
+   changing it - another process may be using those pages, or a previous manual setting may be worth keeping.
+2. If the prior/desired reservation was 0, release the 2 MB pages with `sudo sysctl -w vm.nr_hugepages=0`, or
+   reboot the rig (huge-page reservations do not persist across a reboot unless something else re-applies them).
+3. If Extra config had `"1gb-pages": true` enabled, XMRig's 1 GB page pool is separate from the 2 MB pool above
+   and needs its own check/release - it is not touched by `vm.nr_hugepages` or by step 2.
 
 ## Building from source
 
