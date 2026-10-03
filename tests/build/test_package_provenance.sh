@@ -51,7 +51,7 @@ fake_out() {   # (re)writes $T/out: fake xmrig/bloxsense "binaries" + a build.pr
 run_package() { rm -rf "$T/pkgout"; mkdir -p "$T/pkgout"; ( cd "$REPO" && bash build/package.sh "$T/out" "$T/pkgout" ) > "$T/pkg.out" 2>&1; }
 
 fake_out
-if run_package && [[ -f $T/pkgout/bloxminer-x-1.0.1.tar.gz && -f $T/pkgout/bloxminer-x-1.0.1-src.tar.gz ]]; then
+if run_package && [[ -f $T/pkgout/bloxminer-x-1.0.2.tar.gz && -f $T/pkgout/bloxminer-x-1.0.2-src.tar.gz ]]; then
 	ok "baseline: untampered sources -> package.sh succeeds, both artefacts produced"
 else
 	bad "baseline: untampered sources -> package.sh succeeds, both artefacts produced" "$(cat "$T/pkg.out")"
@@ -63,7 +63,7 @@ if ! run_package && grep -q "bloxminer-x/h-stats.sh does not match its recorded 
 else
 	bad "tampered h-stats.sh (after build) -> package.sh refuses" "rc=$? out=$(cat "$T/pkg.out")"
 fi
-if [[ ! -f $T/pkgout/bloxminer-x-1.0.1.tar.gz ]]; then ok "tampered h-stats.sh -> no package written"; else bad "tampered h-stats.sh -> no package written" "package exists"; fi
+if [[ ! -f $T/pkgout/bloxminer-x-1.0.2.tar.gz ]]; then ok "tampered h-stats.sh -> no package written"; else bad "tampered h-stats.sh -> no package written" "package exists"; fi
 
 fake_out   # re-snapshot: now the (tampered) content IS what provenance expects -> must succeed again
 if run_package; then ok "re-snapshotted provenance after edit -> succeeds again (checks current content, not a fixed list)"; else bad "re-snapshotted provenance after edit -> succeeds again" "$(cat "$T/pkg.out")"; fi
