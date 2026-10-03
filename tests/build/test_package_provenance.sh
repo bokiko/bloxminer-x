@@ -37,7 +37,7 @@ fake_out() {   # (re)writes $T/out: fake xmrig/bloxsense "binaries" + a build.pr
 		echo "dep.hwloc.version=2.12.1"; echo "dep.hwloc.url=https://download.open-mpi.org/release/hwloc/v2.12/hwloc-2.12.1.tar.gz"
 		echo "dep.hwloc.sha256=ffa02c3a308275a9339fbe92add054fac8e9a00cb8fe8c53340094012cb7c633"
 		echo "dep.openssl.version=3.5.9"; echo "dep.openssl.url=https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz"
-		echo "dep.openssl.sha256=57e03c50feab5d31b152af2b764f10379aecd8ee92f16c985983ce4a99f7ef86"
+		echo "dep.openssl.sha256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
 		echo "source_date_epoch=1774703046"
 		echo "cflags=-O2"; echo "cxxflags=-O2"
 		echo "compiler.gcc=fake"; echo "compiler.gxx=fake"; echo "compiler.cmake=fake"
