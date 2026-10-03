@@ -209,6 +209,12 @@ Two keys are handled specially:
 Anything else passes straight through, e.g. `"cpu": {"max-threads-hint": 50}` or `"cpu": {"rx": [0,1,2,3]}`
 to steer XMRig's own thread autoconfiguration, or `"randomx": {"rdmsr": false}`.
 
+**TLS (since 1.0.3):** XMRig is built with OpenSSL 3.5 LTS at its default security level 2. TLS 1.2 and 1.3
+pools with modern certificates work (tested: `pool.supportxmr.com:443` on TLS 1.3, `monerohash.com:9999` and
+`pool.xmr.pt:9000` on TLS 1.2-only). A pool whose certificate uses an RSA key under 2048 bits or a SHA-1
+signature is refused during the handshake; BloxMiner-X does not lower OpenSSL's security level to allow it. Use
+that pool's plain `stratum+tcp://` port, or a different pool.
+
 **Limitation (since 1.0.0):** the pool list is always exactly the one flight-sheet pool; Extra config cannot add
 a failover/backup pool via a `"pools"` array (any `"pools"` in Extra config is ignored) — the same limitation
 as the Verus BloxMiner.
@@ -257,7 +263,7 @@ build/package.sh <outdir> [pkgdir]
 
 `build/build.sh` clones XMRig at the pinned tag (`v6.26.0`, commit `b2ca72480c58d197e18c885d9fc1a0c8d517e60a`),
 verifies the exact commit, applies [`build/donate0.patch`](build/donate0.patch) (the only source change), builds
-static libuv, hwloc and OpenSSL from sha256-pinned tarballs, and builds both `xmrig` and `bloxsense` as static
+static libuv, hwloc and OpenSSL (3.5 LTS) from sha256-pinned tarballs, and builds both `xmrig` and `bloxsense` as static
 binaries (no dynamic library dependencies).
 
 `build/package.sh` assembles two artefacts: the HiveOS package `bloxminer-x-<version>.tar.gz` (with a generated
