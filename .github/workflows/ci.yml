@@ -54,6 +54,11 @@ jobs:
         run: |
           out/xmrig --version | tee /tmp/xmrig-version.out
           grep -q "^XMRig 6.26.0" /tmp/xmrig-version.out || { echo "xmrig --version did not report the pinned 6.26.0"; exit 1; }
+          # the statically linked deps really are the versions build.sh pins (not whatever a header search found)
+          for d in UV:libuv HWLOC:hwloc SSL:OpenSSL; do
+            v=$(sed -n "s/^${d%%:*}_VER=//p" build/build.sh)
+            grep -qx "${d#*:}/$v" /tmp/xmrig-version.out || { echo "xmrig --version does not report ${d#*:}/$v (build.sh pin)"; exit 1; }
+          done
       - name: bloxsense exists and runs
         run: |
           test -x out/bloxsense
