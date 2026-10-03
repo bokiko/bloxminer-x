@@ -323,11 +323,13 @@ CFG
 	# Wait until XMRig's own API reports a populated 10 s hashrate average (null/0 until RandomX dataset init -
 	# ~7 s on ai02, far longer on a small CI runner - plus a full 10 s window): a fixed sleep was enough on the
 	# dev box but would make this case flaky on slower hosts. Capped at 180 s; real CPU load throughout.
-	warm=0
-	for _ in $(seq 1 180); do
+	warm=0; warm_deadline=$((SECONDS + 180))
+	while (( SECONDS < warm_deadline )); do
 		kill -0 "$XMRIG_PID" 2>/dev/null || break
-		h=$(curl -s --max-time 2 http://127.0.0.1:4070/2/summary | jq -r '.hashrate.total[0] // 0' 2>/dev/null)
-		awk -v k="${h:-0}" 'BEGIN{exit !(k > 0)}' && { warm=1; break; }
+		# Non-empty check in bash first: jq 1.6 (this repo's CI and real rigs) exits 0 for `-e` on EMPTY input,
+		# which is exactly what curl yields before xmrig's API is up - that would end the wait instantly.
+		sum=$(curl -s --max-time 2 http://127.0.0.1:4070/2/summary)
+		[[ -n $sum ]] && jq -e '.hashrate.total[0] | type == "number" and . > 0' >/dev/null 2>&1 <<< "$sum" && { warm=1; break; }
 		sleep 1
 	done
 	(( warm )) || echo "  (xmrig hashrate[0] still unpopulated after warm-up; polling anyway - the assertion below decides)"
@@ -345,6 +347,7 @@ CFG
 		ok "REAL xmrig --bench under full CPU load: khs=$khs, $nrows rows, < 3.0 s (${elapsed}s)"
 	else
 		bad "REAL xmrig --bench under full CPU load: khs > 0, rows > 0, < 3.0 s" "elapsed=${elapsed}s khs=$khs rows=$nrows res=$res"
+		echo "  --- xmrig console (last 40 lines) ---"; tail -n 40 "$REAL_DIR/console.txt" 2>/dev/null | sed 's/^/  /'
 	fi
 	kill -9 "$XMRIG_PID" 2>/dev/null; wait "$XMRIG_PID" 2>/dev/null; XMRIG_PID=""
 elif [[ $REQUIRE_REAL == 1 ]]; then
