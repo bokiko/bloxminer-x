@@ -54,6 +54,31 @@ done
 hc "p:1" "W.rig" "" "cn/r" "";  check_fail "algo not in the RandomX family rejected" "Algorithm must be one of"
 hc "p:1" "W.rig" "" "rx" "";    check_fail "algo rx (not rx/0) rejected" "Algorithm must be one of"
 
+# ---- HiveOS flight-sheet bug (real-rig report): the "Hash algorithm" field writes HiveOS's OWN algo display
+# name into CUSTOM_ALGO, not XMRig's - confirmed from /hive/opt/algomap/custom.json on a real rig. Our own live
+# test had missed this because CUSTOM_ALGO was set to rx/0 by hand (editing wallet.conf), never through the
+# actual flight-sheet UI path. Each Hive name here maps to its one XMRig rx/* equivalent; rx/wow and rx/yada
+# have no Hive name at all (see HIVE_ALGO_MAP's own header in h-config.sh) and are deliberately NOT given one.
+declare -A HIVE_NAMES=([randomx]=rx/0 [randomx-arq]=rx/arq [randomx-grft]=rx/graft [randomx-sfx]=rx/sfx)
+for hive_name in "${!HIVE_NAMES[@]}"; do
+	hc "p:1" "W.rig" "" "$hive_name" ""
+	check_cfg "HiveOS algo name $hive_name -> ${HIVE_NAMES[$hive_name]}" ".pools[0].algo == \"${HIVE_NAMES[$hive_name]}\""
+done
+hc "p:1" "W.rig" "" "RANDOMX" "";     check_cfg "HiveOS algo name is case-insensitive (RANDOMX)" '.pools[0].algo == "rx/0"'
+hc "p:1" "W.rig" "" " randomx " "";   check_cfg "HiveOS algo name tolerates surrounding whitespace" '.pools[0].algo == "rx/0"'
+hc "p:1" "W.rig" "" "RaNdOmX-ArQ" ""; check_cfg "HiveOS algo name mapping is also case-insensitive" '.pools[0].algo == "rx/arq"'
+# rx/* names themselves still work unchanged (already covered by the allow-list loop above) - these two just
+# confirm they are UNAFFECTED by the new normalisation step (still case-sensitive/no whitespace stripping
+# claimed for them beyond what the loop above already proves; this is about the Hive-name path not interfering).
+hc "p:1" "W.rig" "" "rx/arq" "";      check_cfg "rx/* names still accepted unchanged" '.pools[0].algo == "rx/arq"'
+# unknown names - including names that LOOK like a Hive name but have no mapping (rx/wow has none) - still
+# rejected with the same message, now naming both forms.
+hc "p:1" "W.rig" "" "cryptonight" ""; check_fail "unknown algo name (cryptonight) still rejected" "Algorithm must be one of"
+hc "p:1" "W.rig" "" "randomwow" "";   check_fail "unknown algo name (randomwow) still rejected" "Algorithm must be one of"
+hc "p:1" "W.rig" "" "rx/foo" "";      check_fail "unknown rx/* name (rx/foo) still rejected" "Algorithm must be one of"
+hc "p:1" "W.rig" "" "randomx-wow" ""; check_fail "randomx-wow has no Hive mapping (none invented) - still rejected" "Algorithm must be one of"
+check_out "error message lists the HiveOS names too" "matching HiveOS name"
+
 # ---- protected keys are dropped with a message; cpu.enabled (nested) too
 hc "p:1" "W.rig" "" "" '"donate-level": 5, "donate-over-proxy": 1, "http": {"port": 9}, "api": {}, "autosave": true, "log-file": "/tmp/x", "background": true, "syslog": true, "opencl": {"enabled": true}, "cuda": {"enabled": true}'
 check_cfg "protected keys stay fixed" \
@@ -226,7 +251,7 @@ task "tmgmt" "0-31"   # a management thread keeping the full mask must not confu
 bloxsense_says "$(fake_topo_json 16)"
 stats_case "per-core grouping, 16C/32T, bound and verified" 20001 "$SUM_OK" "$BACK_16C32T" \
 	'(.stats.hs | length) == 16 and .stats.uptime == 321 and .stats.ar == [15, 1] and .stats.cpu_power == 95 and
-	 .stats.ver == "bloxminer-x 1.0.1 (xmrig 6.26.0)" and .stats.algo == "rx/0" and
+	 .stats.ver == "bloxminer-x 1.0.2 (xmrig 6.26.0)" and .stats.algo == "rx/0" and
 	 (.stats.hs[0] == (((100 + 0) * 10 + (100 + 16) * 10) / 1000)) and (.stats.temp[0] == 55)'
 
 BACK_NULLS=$(python3 - <<'PY'
@@ -1240,6 +1265,28 @@ if jq -e . > /dev/null 2>&1 <<< "$res" && [[ $(jq -r '.stats.algo' <<< "$res" 2>
 	ok "config.json algo with a quote -> rejected by the regex gate, falls back to rx/0, valid JSON"
 else
 	bad "config.json algo with a quote -> rejected by the regex gate, falls back to rx/0, valid JSON" "$res"
+fi
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+jq -n '{pools: [{algo: "rx/0"}]}' > "$CONF"   # restore - later tests in this file expect the normal config
+
+# ---- end to end, the real-rig bug this release fixes: h-config.sh writes config.json from CUSTOM_ALGO=randomx
+# (the ACTUAL value HiveOS's flight-sheet UI sends, not a hand-edited rx/0 - see h-config.sh's own tests,
+# above, for the normalisation itself), then a REAL h-stats.sh poll against that SAME config.json must report
+# stats.algo "rx/0" - HiveOS's own algomap translates rx/0 BACK to "randomx" for display, so the value stored
+# in config.json and reported in h-stats.sh's own JSON must stay the XMRig form the whole way through, never
+# the Hive one bokiko's rig was actually sent.
+reset_proc; listen 20050 1150 "$BLOX_DIR/xmrig"
+hc "p:1" "W.rig" "" "randomx" "";  check_cfg "end-to-end setup: config.json written from CUSTOM_ALGO=randomx" '.pools[0].algo == "rx/0"'
+SUM_ALGO_E2E=$(jq -nc '{uptime: 1, connection: {accepted: 0, rejected: 0}, algo: "rx/0", version: "6.26.0", hashrate: {total: [1000.0]}}')
+jq -n --argjson s "$SUM_ALGO_E2E" --argjson b null '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20050 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+# shellcheck disable=SC2016   # $BLOX_DIR/$khs/$stats expand in the inner bash -c, not here
+res_algo_e2e=$(BLOX_API_PORT=20050 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+if [[ $(jq -r '.stats.algo' <<< "$res_algo_e2e" 2>/dev/null) == "rx/0" ]]; then
+	ok "end-to-end: CUSTOM_ALGO=randomx -> h-config writes rx/0 -> h-stats reports stats.algo rx/0"
+else
+	bad "end-to-end: CUSTOM_ALGO=randomx -> h-config writes rx/0 -> h-stats reports stats.algo rx/0" "$res_algo_e2e"
 fi
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 jq -n '{pools: [{algo: "rx/0"}]}' > "$CONF"   # restore - later tests in this file expect the normal config

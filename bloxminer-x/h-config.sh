@@ -4,7 +4,11 @@
 #   CUSTOM_URL         pool: stratum+tcp://host:port, stratum+ssl://host:port or host:port (first line is used)
 #   CUSTOM_TEMPLATE    wallet(.worker) template, e.g. %WAL%.%WORKER_NAME% -> pools[0].user
 #   CUSTOM_PASS        pool password (NOT a thread count - this differs from the Verus BloxMiner) -> pools[0].pass
-#   CUSTOM_ALGO        RandomX variant: rx/0, rx/wow, rx/arq, rx/graft, rx/sfx or rx/yada; empty = rx/0
+#   CUSTOM_ALGO        RandomX variant: rx/0, rx/wow, rx/arq, rx/graft, rx/sfx or rx/yada; empty = rx/0.
+#                      Case-insensitive, whitespace stripped. The flight sheet's "Hash algorithm" field writes
+#                      HiveOS's OWN algo name here, not XMRig's - also accepted and mapped to its rx/*
+#                      equivalent: randomx -> rx/0, randomx-arq -> rx/arq, randomx-grft -> rx/graft,
+#                      randomx-sfx -> rx/sfx (no Hive name exists for rx/wow or rx/yada).
 #   CUSTOM_USER_CONFIG optional JSON members, merged into defaults (print-time, colors) before the fixed/
 #                      protected settings, e.g. "print-time": 30
 #                      "tls": true            - force TLS on the pool connection (stratum+ssl:// already does)
@@ -22,6 +26,14 @@ SYSROOT=${BLOX_SYSFS_ROOT:-}                                       # /sys path p
 # "cpu.enabled"/"cpu.huge-pages" are protected the same way but live one level down and are handled separately.
 PROTECTED='["donate-level","donate-over-proxy","http","api","autosave","log-file","background","syslog","opencl","cuda"]'
 ALGOS='["rx/0","rx/wow","rx/arq","rx/graft","rx/sfx","rx/yada"]'
+# HiveOS's own flight-sheet "Hash algorithm" field writes HiveOS's own display name into CUSTOM_ALGO, not
+# XMRig's - confirmed from /hive/opt/algomap/custom.json on a real rig (XMRig name -> Hive name): rx/0 ->
+# randomx, rx/arq -> randomx-arq, rx/graft -> randomx-grft, rx/sfx -> randomx-sfx. That file has no Hive name
+# for rx/wow or rx/yada at all, so those two remain reachable only by typing the XMRig name directly (still
+# accepted below, unchanged) - never invent a Hive alias for either. A real-rig bug (flight sheet set up
+# through the UI, CUSTOM_ALGO=randomx) was rejected outright before this map existed - our own live test
+# missed it because CUSTOM_ALGO was set to rx/0 by hand (editing wallet.conf), never through the flight sheet.
+declare -A HIVE_ALGO_MAP=([randomx]=rx/0 [randomx-arq]=rx/arq [randomx-grft]=rx/graft [randomx-sfx]=rx/sfx)
 
 fail() { echo "$1"; message error "$1" 2>/dev/null; exit 1; }
 
@@ -29,9 +41,16 @@ url=$(head -n1 <<< "$CUSTOM_URL" | tr -d '[:space:]')
 [[ -n $url ]] || fail "BloxMiner-X: the pool URL in the flight sheet is empty"
 [[ $url == stratum+* ]] || url="stratum+tcp://$url"   # XMRig parses stratum+tcp:// / stratum+ssl:// itself
 
-algo=${CUSTOM_ALGO:-rx/0}
+# Normalise BEFORE validating: case-insensitive, whitespace stripped (flight-sheet fields are free text), THEN
+# mapped through HIVE_ALGO_MAP above - a Hive name becomes its XMRig rx/* equivalent, anything else (including
+# every rx/* name itself) passes through unchanged into the SAME allow-list check as before. $algo_raw keeps
+# the ORIGINAL, unmodified value for the error message only - never written anywhere, never normalised itself.
+algo_raw=${CUSTOM_ALGO:-rx/0}
+algo=$(tr '[:upper:]' '[:lower:]' <<< "$algo_raw" | tr -d '[:space:]')
+[[ -n $algo ]] || algo=rx/0   # whitespace-only CUSTOM_ALGO normalises to empty - same default as unset/empty
+algo=${HIVE_ALGO_MAP[$algo]:-$algo}
 if ! jq -ne --argjson a "$ALGOS" --arg algo "$algo" '$a | index($algo) != null' > /dev/null; then
-	fail "BloxMiner-X: Algorithm must be one of $(jq -rc . <<< "$ALGOS") (got $algo)"
+	fail "BloxMiner-X: Algorithm must be one of $(jq -rc . <<< "$ALGOS") or a matching HiveOS name (randomx, randomx-arq, randomx-grft, randomx-sfx) (got $algo_raw)"
 fi
 
 extra='{}'
