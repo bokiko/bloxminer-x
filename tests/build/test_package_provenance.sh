@@ -36,8 +36,8 @@ fake_out() {   # (re)writes $T/out: fake xmrig/bloxsense "binaries" + a build.pr
 		echo "dep.libuv.sha256=5f0557b90b1106de71951a3c3931de5e0430d78da1d9a10287ebc7a3f78ef8eb"
 		echo "dep.hwloc.version=2.12.1"; echo "dep.hwloc.url=https://download.open-mpi.org/release/hwloc/v2.12/hwloc-2.12.1.tar.gz"
 		echo "dep.hwloc.sha256=ffa02c3a308275a9339fbe92add054fac8e9a00cb8fe8c53340094012cb7c633"
-		echo "dep.openssl.version=3.0.16"; echo "dep.openssl.url=https://github.com/openssl/openssl/releases/download/openssl-3.0.16/openssl-3.0.16.tar.gz"
-		echo "dep.openssl.sha256=57e03c50feab5d31b152af2b764f10379aecd8ee92f16c985983ce4a99f7ef86"
+		echo "dep.openssl.version=3.5.9"; echo "dep.openssl.url=https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz"
+		echo "dep.openssl.sha256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
 		echo "source_date_epoch=1774703046"
 		echo "cflags=-O2"; echo "cxxflags=-O2"
 		echo "compiler.gcc=fake"; echo "compiler.gxx=fake"; echo "compiler.cmake=fake"
@@ -51,7 +51,7 @@ fake_out() {   # (re)writes $T/out: fake xmrig/bloxsense "binaries" + a build.pr
 run_package() { rm -rf "$T/pkgout"; mkdir -p "$T/pkgout"; ( cd "$REPO" && bash build/package.sh "$T/out" "$T/pkgout" ) > "$T/pkg.out" 2>&1; }
 
 fake_out
-if run_package && [[ -f $T/pkgout/bloxminer-x-1.0.2.tar.gz && -f $T/pkgout/bloxminer-x-1.0.2-src.tar.gz ]]; then
+if run_package && [[ -f $T/pkgout/bloxminer-x-1.0.3.tar.gz && -f $T/pkgout/bloxminer-x-1.0.3-src.tar.gz ]]; then
 	ok "baseline: untampered sources -> package.sh succeeds, both artefacts produced"
 else
 	bad "baseline: untampered sources -> package.sh succeeds, both artefacts produced" "$(cat "$T/pkg.out")"
@@ -63,7 +63,7 @@ if ! run_package && grep -q "bloxminer-x/h-stats.sh does not match its recorded 
 else
 	bad "tampered h-stats.sh (after build) -> package.sh refuses" "rc=$? out=$(cat "$T/pkg.out")"
 fi
-if [[ ! -f $T/pkgout/bloxminer-x-1.0.2.tar.gz ]]; then ok "tampered h-stats.sh -> no package written"; else bad "tampered h-stats.sh -> no package written" "package exists"; fi
+if [[ ! -f $T/pkgout/bloxminer-x-1.0.3.tar.gz ]]; then ok "tampered h-stats.sh -> no package written"; else bad "tampered h-stats.sh -> no package written" "package exists"; fi
 
 fake_out   # re-snapshot: now the (tampered) content IS what provenance expects -> must succeed again
 if run_package; then ok "re-snapshotted provenance after edit -> succeeds again (checks current content, not a fixed list)"; else bad "re-snapshotted provenance after edit -> succeeds again" "$(cat "$T/pkg.out")"; fi

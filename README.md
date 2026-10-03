@@ -13,7 +13,7 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Version-1.0.2-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.0.3-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/Based_on-XMRig_6.26.0-00599C?style=flat-square" alt="XMRig">
   <img src="https://img.shields.io/badge/Algorithm-RandomX-blue?style=flat-square" alt="RandomX">
   <img src="https://img.shields.io/badge/Platform-Linux_x86--64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
@@ -75,7 +75,7 @@ CPU miner, same HiveOS custom-miner packaging.
    - Miner name: `bloxminer-x`
    - Installation URL:
      ```
-     https://github.com/bokiko/bloxminer-x/releases/download/1.0.2/bloxminer-x-1.0.2.tar.gz
+     https://github.com/bokiko/bloxminer-x/releases/download/1.0.3/bloxminer-x-1.0.3.tar.gz
      ```
    - Hash algorithm: `randomx` (HiveOS's own name for Monero RandomX; `rx/0` is also accepted)
    - Wallet and worker template: `%WAL%.%WORKER_NAME%`
@@ -90,7 +90,7 @@ CPU miner, same HiveOS custom-miner packaging.
 |-------|-------|-------|
 | Miner | `custom` | Required |
 | Miner name | `bloxminer-x` | Must match exactly |
-| Installation URL | `https://github.com/bokiko/bloxminer-x/releases/download/1.0.2/bloxminer-x-1.0.2.tar.gz` | HiveOS installs it once and reuses it |
+| Installation URL | `https://github.com/bokiko/bloxminer-x/releases/download/1.0.3/bloxminer-x-1.0.3.tar.gz` | HiveOS installs it once and reuses it |
 | Hash algorithm | `randomx` | HiveOS's own name for Monero RandomX, same as what the flight-sheet dropdown writes; `rx/0` is also accepted (XMRig's own name for the same algo). Other RandomX-family coins: `randomx-arq` (or `rx/arq`), `randomx-grft` (or `rx/graft`), `randomx-sfx` (or `rx/sfx`) — HiveOS has no name for `rx/wow` or `rx/yada`, so those two must be typed exactly as shown. Case-insensitive, extra spaces are ignored |
 | Wallet template | `%WAL%.%WORKER_NAME%` | Your wallet.worker |
 | Pool URL | `stratum+tcp://host:port`, `stratum+ssl://host:port`, or plain `host:port` | Your pool (plain `host:port` defaults to `stratum+tcp://`) |
@@ -100,7 +100,7 @@ CPU miner, same HiveOS custom-miner packaging.
 ### HiveOS Terminal Install
 
 ```bash
-/hive/miners/custom/custom-get https://github.com/bokiko/bloxminer-x/releases/download/1.0.2/bloxminer-x-1.0.2.tar.gz
+/hive/miners/custom/custom-get https://github.com/bokiko/bloxminer-x/releases/download/1.0.3/bloxminer-x-1.0.3.tar.gz
 ```
 
 Then set the flight sheet as above. On a fresh HiveOS image, HiveOS installs its custom-miner support automatically
@@ -108,7 +108,7 @@ the first time a flight sheet uses a Custom miner.
 
 ### Updating
 
-Change the version in the Installation URL (e.g. `1.0.1` → `1.0.2`) and apply the flight sheet.
+Change the version in the Installation URL (e.g. `1.0.2` → `1.0.3`) and apply the flight sheet.
 HiveOS downloads the new package and restarts the miner. Your flight sheet fields stay the same.
 
 ---
@@ -209,6 +209,12 @@ Two keys are handled specially:
 Anything else passes straight through, e.g. `"cpu": {"max-threads-hint": 50}` or `"cpu": {"rx": [0,1,2,3]}`
 to steer XMRig's own thread autoconfiguration, or `"randomx": {"rdmsr": false}`.
 
+**TLS (since 1.0.3):** XMRig is built with OpenSSL 3.5 LTS at its default security level 2. TLS 1.2 and 1.3
+pools with modern certificates work (tested: `pool.supportxmr.com:443` on TLS 1.3, `monerohash.com:9999` and
+`pool.xmr.pt:9000` on TLS 1.2-only). A pool whose certificate uses an RSA key under 2048 bits or a SHA-1
+signature is refused during the handshake; BloxMiner-X does not lower OpenSSL's security level to allow it. Use
+that pool's plain `stratum+tcp://` port, or a different pool.
+
 **Limitation (since 1.0.0):** the pool list is always exactly the one flight-sheet pool; Extra config cannot add
 a failover/backup pool via a `"pools"` array (any `"pools"` in Extra config is ignored) — the same limitation
 as the Verus BloxMiner.
@@ -257,7 +263,7 @@ build/package.sh <outdir> [pkgdir]
 
 `build/build.sh` clones XMRig at the pinned tag (`v6.26.0`, commit `b2ca72480c58d197e18c885d9fc1a0c8d517e60a`),
 verifies the exact commit, applies [`build/donate0.patch`](build/donate0.patch) (the only source change), builds
-static libuv, hwloc and OpenSSL from sha256-pinned tarballs, and builds both `xmrig` and `bloxsense` as static
+static libuv, hwloc and OpenSSL (3.5 LTS) from sha256-pinned tarballs, and builds both `xmrig` and `bloxsense` as static
 binaries (no dynamic library dependencies).
 
 `build/package.sh` assembles two artefacts: the HiveOS package `bloxminer-x-<version>.tar.gz` (with a generated

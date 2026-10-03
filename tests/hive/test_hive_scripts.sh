@@ -251,7 +251,7 @@ task "tmgmt" "0-31"   # a management thread keeping the full mask must not confu
 bloxsense_says "$(fake_topo_json 16)"
 stats_case "per-core grouping, 16C/32T, bound and verified" 20001 "$SUM_OK" "$BACK_16C32T" \
 	'(.stats.hs | length) == 16 and .stats.uptime == 321 and .stats.ar == [15, 1] and .stats.cpu_power == 95 and
-	 .stats.ver == "bloxminer-x 1.0.2 (xmrig 6.26.0)" and .stats.algo == "rx/0" and
+	 .stats.ver == "bloxminer-x 1.0.3 (xmrig 6.26.0)" and .stats.algo == "rx/0" and
 	 (.stats.hs[0] == (((100 + 0) * 10 + (100 + 16) * 10) / 1000)) and (.stats.temp[0] == 55)'
 
 BACK_NULLS=$(python3 - <<'PY'
