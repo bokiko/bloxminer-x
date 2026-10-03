@@ -9,7 +9,10 @@
 # two-read sample), and case 2 uses the actual compiled bloxsense binary when available - so the measured wall
 # times reflect true end-to-end latency under load, not an artificially fast stand-in.
 # Usage: tests/hive/test_under_load.sh (needs jq, curl, python3, bash, nproc; case 2 additionally needs a
-# built xmrig at ~/bxwork/out/xmrig - e.g. from build/build.sh - and is skipped if that is not present)
+# built xmrig - e.g. from build/build.sh - at $BLOX_XMRIG_BIN, default ~/bxwork/out/xmrig, plus optionally the
+# real bloxsense at $BLOX_BLOXSENSE_BIN, default ~/bxwork/out/bloxsense; case 2 is skipped if xmrig is not
+# present, unless BLOX_REQUIRE_REAL_ENGINE=1 - CI's under-load-real job sets it, so there a missing binary, or
+# falling back to the bloxsense fixture, is a FAIL instead of a silent skip)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); PKGSRC=$(cd "$HERE/../../bloxminer-x" && pwd)
 T=$(mktemp -d)
@@ -281,7 +284,9 @@ kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 unset BLOX_PROCFS_ROOT
 
 # ================================================================== case 2: REAL /proc, REAL xmrig --bench, full CPU load
-XMRIG_BIN="$HOME/bxwork/out/xmrig"
+XMRIG_BIN="${BLOX_XMRIG_BIN:-$HOME/bxwork/out/xmrig}"
+BLOXSENSE_BIN="${BLOX_BLOXSENSE_BIN:-$HOME/bxwork/out/bloxsense}"
+REQUIRE_REAL=${BLOX_REQUIRE_REAL_ENGINE:-0}
 if [[ -x $XMRIG_BIN ]]; then
 	# xmrig runs FROM the package dir (not a separate work dir + symlink): the ownership check compares
 	# /proc/<pid>/exe (the kernel's own canonical path to what was actually exec'd) against "$PKG/xmrig" as a
@@ -289,11 +294,11 @@ if [[ -x $XMRIG_BIN ]]; then
 	REAL_DIR="$T/pkg2"; mkdir -p "$REAL_DIR" "$T/log2"
 	cp "$PKGSRC"/h-config.sh "$PKGSRC"/h-stats.sh "$REAL_DIR"/
 	cp "$XMRIG_BIN" "$REAL_DIR/xmrig"
-	BLOXSENSE_BIN="$HOME/bxwork/out/bloxsense"
 	if [[ -x $BLOXSENSE_BIN ]]; then
 		cp "$BLOXSENSE_BIN" "$REAL_DIR/bloxsense"   # the REAL binary: genuinely real topology, temps and RAPL timing on this box
 	else
 		cp "$BLOX_DIR/bloxsense" "$REAL_DIR/bloxsense"   # fallback: the ~0.55 s-sleeping fixture, if bloxsense was not built
+		[[ $REQUIRE_REAL == 1 ]] && bad "REAL bloxsense present (BLOX_REQUIRE_REAL_ENGINE=1)" "$BLOXSENSE_BIN not found/executable - fell back to the fixture"
 	fi
 	sed -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/config2.json#" \
 	    -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/log2/bloxminer-x#" "$PKGSRC/h-manifest.conf" > "$REAL_DIR/h-manifest.conf"
@@ -315,8 +320,17 @@ CFG
 	# real xmrig process instead of stopping it (found while writing this very test).
 	( cd "$REAL_DIR" || exit 1; exec ./xmrig -c xmrig-config.json --bench=10M > console.txt 2>&1 ) &
 	XMRIG_PID=$!
-	sleep 20   # RandomX dataset init (~7 s on this box) + a full 10 s window so XMRig's own hashrate[0]
-	           # average is actually populated (it reports null/0 before that; real CPU load throughout either way)
+	# Wait until XMRig's own API reports a populated 10 s hashrate average (null/0 until RandomX dataset init -
+	# ~7 s on ai02, far longer on a small CI runner - plus a full 10 s window): a fixed sleep was enough on the
+	# dev box but would make this case flaky on slower hosts. Capped at 180 s; real CPU load throughout.
+	warm=0
+	for _ in $(seq 1 180); do
+		kill -0 "$XMRIG_PID" 2>/dev/null || break
+		h=$(curl -s --max-time 2 http://127.0.0.1:4070/2/summary | jq -r '.hashrate.total[0] // 0' 2>/dev/null)
+		awk -v k="${h:-0}" 'BEGIN{exit !(k > 0)}' && { warm=1; break; }
+		sleep 1
+	done
+	(( warm )) || echo "  (xmrig hashrate[0] still unpopulated after warm-up; polling anyway - the assertion below decides)"
 
 	export BLOX_DIR="$REAL_DIR" BLOX_API_PORT=4070
 	unset BLOX_PROCFS_ROOT   # the REAL /proc this time - whatever this box's real process table looks like
@@ -333,6 +347,8 @@ CFG
 		bad "REAL xmrig --bench under full CPU load: khs > 0, rows > 0, < 3.0 s" "elapsed=${elapsed}s khs=$khs rows=$nrows res=$res"
 	fi
 	kill -9 "$XMRIG_PID" 2>/dev/null; wait "$XMRIG_PID" 2>/dev/null; XMRIG_PID=""
+elif [[ $REQUIRE_REAL == 1 ]]; then
+	bad "REAL xmrig bench case (BLOX_REQUIRE_REAL_ENGINE=1)" "$XMRIG_BIN not found/executable"
 else
 	echo "SKIP: real xmrig bench case ($XMRIG_BIN not found - build it first with build/build.sh)"
 fi
