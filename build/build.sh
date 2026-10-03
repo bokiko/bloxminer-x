@@ -24,7 +24,10 @@ HELPERS=(bloxsense/blox.h bloxsense/blox_sys.cpp bloxsense/bloxsense.cpp
          build/build.sh build/package.sh build/donate0.patch)
 
 # Dependency tarballs xmrig's own scripts/build.uv.sh, build.hwloc.sh, build.openssl3.sh fetch for this tag,
-# pinned by sha256 computed by hand from these exact URLs (upstream ships no checksums for them).
+# pinned by sha256 computed by hand from these exact URLs (upstream ships no checksums for them) - EXCEPT
+# OpenSSL: XMRig 6.26.0's script fetches 3.0.x, a line OpenSSL no longer supports (no public security fixes),
+# and since it is linked statically a rig's own OS updates can never patch it, so 1.0.3 pins the 3.5 LTS
+# (supported to 2030-04-08) instead; its sha256 also matches upstream's own published .sha256 file.
 UV_VER=1.51.0
 UV_URL="https://dist.libuv.org/dist/v${UV_VER}/libuv-v${UV_VER}.tar.gz"
 UV_SHA256=5f0557b90b1106de71951a3c3931de5e0430d78da1d9a10287ebc7a3f78ef8eb
@@ -33,9 +36,9 @@ HWLOC_VER=2.12.1
 HWLOC_URL="https://download.open-mpi.org/release/hwloc/v2.12/hwloc-${HWLOC_VER}.tar.gz"
 HWLOC_SHA256=ffa02c3a308275a9339fbe92add054fac8e9a00cb8fe8c53340094012cb7c633
 
-SSL_VER=3.0.16
+SSL_VER=3.5.9
 SSL_URL="https://github.com/openssl/openssl/releases/download/openssl-${SSL_VER}/openssl-${SSL_VER}.tar.gz"
-SSL_SHA256=57e03c50feab5d31b152af2b764f10379aecd8ee92f16c985983ce4a99f7ef86
+SSL_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
 
 id -u >/dev/null 2>&1   # sanity: a shell exists
 [[ $(id -u) == 0 ]] || { echo "build/build.sh must run as root in a stock Ubuntu 22.04 container/chroot" >&2; exit 1; }
