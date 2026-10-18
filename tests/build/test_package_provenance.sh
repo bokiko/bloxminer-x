@@ -41,7 +41,7 @@ fake_out() {   # (re)writes $T/out: fake xmrig/bloxsense "binaries" + a build.pr
 		echo "source_date_epoch=1774703046"
 		echo "cflags=-O2"; echo "cxxflags=-O2"
 		echo "compiler.gcc=fake"; echo "compiler.gxx=fake"; echo "compiler.cmake=fake"
-		echo "os=fake test fixture"
+		echo "os=fake test fixture"; echo "build_image=fake"; echo "libc=musl fake"
 		echo "xmrig_sha256=$(sha256sum "$T/out/xmrig" | cut -d' ' -f1)"
 		echo "bloxsense_sha256=$(sha256sum "$T/out/bloxsense" | cut -d' ' -f1)"
 		for h in "${HELPERS[@]}"; do echo "helper.$h.sha256=$(sha256sum "$REPO/$h" | cut -d' ' -f1)"; done
@@ -51,7 +51,7 @@ fake_out() {   # (re)writes $T/out: fake xmrig/bloxsense "binaries" + a build.pr
 run_package() { rm -rf "$T/pkgout"; mkdir -p "$T/pkgout"; ( cd "$REPO" && bash build/package.sh "$T/out" "$T/pkgout" ) > "$T/pkg.out" 2>&1; }
 
 fake_out
-if run_package && [[ -f $T/pkgout/bloxminer-x-1.0.3.tar.gz && -f $T/pkgout/bloxminer-x-1.0.3-src.tar.gz ]]; then
+if run_package && [[ -f $T/pkgout/bloxminer-x-1.0.4.tar.gz && -f $T/pkgout/bloxminer-x-1.0.4-src.tar.gz ]]; then
 	ok "baseline: untampered sources -> package.sh succeeds, both artefacts produced"
 else
 	bad "baseline: untampered sources -> package.sh succeeds, both artefacts produced" "$(cat "$T/pkg.out")"
@@ -63,7 +63,7 @@ if ! run_package && grep -q "bloxminer-x/h-stats.sh does not match its recorded 
 else
 	bad "tampered h-stats.sh (after build) -> package.sh refuses" "rc=$? out=$(cat "$T/pkg.out")"
 fi
-if [[ ! -f $T/pkgout/bloxminer-x-1.0.3.tar.gz ]]; then ok "tampered h-stats.sh -> no package written"; else bad "tampered h-stats.sh -> no package written" "package exists"; fi
+if [[ ! -f $T/pkgout/bloxminer-x-1.0.4.tar.gz ]]; then ok "tampered h-stats.sh -> no package written"; else bad "tampered h-stats.sh -> no package written" "package exists"; fi
 
 fake_out   # re-snapshot: now the (tampered) content IS what provenance expects -> must succeed again
 if run_package; then ok "re-snapshotted provenance after edit -> succeeds again (checks current content, not a fixed list)"; else bad "re-snapshotted provenance after edit -> succeeds again" "$(cat "$T/pkg.out")"; fi

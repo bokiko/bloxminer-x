@@ -119,6 +119,8 @@ compiler (bloxsense)    $(p compiler.gxx)
 cmake                   $(p compiler.cmake)
 SOURCE_DATE_EPOCH       $(p source_date_epoch)
 build OS                $(p os)
+build image             $(p build_image)
+libc                    $(p libc)
 bloxminer-x repo commit $REPO_COMMIT
 
 Static dependencies (built from source by build/build.sh, sha256-pinned):
@@ -138,7 +140,8 @@ build/donate0.patch applied, so no network access or upstream checkout is needed
 this is the GPL-3.0 "Corresponding Source" for the binaries in the companion bloxminer-x-<ver>.tar.gz package.
 bloxminer-x/ here holds the HiveOS integration scripts this bundle's own build/package.sh needs to assemble a
 full binary package (it copies them from here, the same files shipped in the companion binary package).
-To rebuild the binaries from this bundle: run build/build.sh (Ubuntu 22.04, as root, in a container/chroot);
+To rebuild the binaries from this bundle: run build/build.sh as root in the Alpine container pinned by its
+BUILD_IMAGE line (musl - see the script header for the docker command);
 it clones xmrig fresh over the network and re-applies the patch itself (verifying the tag's commit and the
 patch's sha256 match what is recorded above), so the result is the same as building from the xmrig/ directory
 included here. bloxsense/ here is built the same way build/build.sh builds it: plain -O2, statically linked,
@@ -147,7 +150,7 @@ SRC2
 	else
 		cat <<SRC3
 
-To rebuild bit-for-bit: run build/build.sh as root in a stock Ubuntu 22.04 container/chroot; it clones xmrig
+To rebuild bit-for-bit: run build/build.sh as root in the Alpine container recorded above; it clones xmrig
 at the tag above, verifies the commit, applies donate0.patch, builds the three static dependencies above from
 the same pinned, checksummed tarballs, and builds xmrig (cmake Release, BUILD_STATIC=ON, no OpenCL/CUDA) and
 bloxsense (plain -O2) exactly as done here. The full GPL "Corresponding Source" (XMRig with the patch already
