@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Reproducible-inputs build of BloxMiner-X: XMRig 6.26.0 (0% donate patch) + bloxsense, both static, for the
-# HiveOS package. Host: stock Ubuntu 22.04 x86_64 (container/chroot), run as root.
+# HiveOS package. Host: the pinned Alpine image below (x86_64, musl), run as root:
+#   docker run --rm -v "$PWD":/src -w /src <BUILD_IMAGE> sh -c 'apk add --no-cache bash && bash build/build.sh out'
 # Usage: build/build.sh [outdir]
+# Why musl (1.0.4): a binary statically linked against glibc still loads the HOST's NSS modules (dlopen) to
+# resolve a pool hostname. On a host whose glibc differs from the build's (e.g. Ubuntu 24.04 / Mint 22, glibc
+# 2.39, with mdns4_minimal in /etc/nsswitch.conf) that crashed xmrig with SIGSEGV in getaddrinfo. musl has its
+# own resolver (/etc/hosts + /etc/resolv.conf) and never loads host libraries - the same libc XMRig's own
+# official linux-static release uses.
 # Writes <outdir>/xmrig, <outdir>/bloxsense, <outdir>/build.provenance (including the sha256 of every helper
 # source file at build time - see HELPERS below - which build/package.sh later re-verifies before packaging).
 set -euo pipefail
@@ -40,14 +46,16 @@ SSL_VER=3.5.9
 SSL_URL="https://github.com/openssl/openssl/releases/download/openssl-${SSL_VER}/openssl-${SSL_VER}.tar.gz"
 SSL_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
 
-id -u >/dev/null 2>&1   # sanity: a shell exists
-[[ $(id -u) == 0 ]] || { echo "build/build.sh must run as root in a stock Ubuntu 22.04 container/chroot" >&2; exit 1; }
-[[ -f /etc/os-release ]] && grep -q '^VERSION_ID="22.04"' /etc/os-release || echo "warning: not detected as Ubuntu 22.04; proceeding anyway" >&2
+# The build container, pinned by digest (CI reads this line). Alpine 3.24.2 = musl 1.2.6.
+BUILD_IMAGE=alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-DEPS=(build-essential cmake git wget ca-certificates pkg-config autoconf automake libtool perl python3 file binutils)
-apt-get install -y -qq "${DEPS[@]}" >/dev/null
+id -u >/dev/null 2>&1   # sanity: a shell exists
+[[ $(id -u) == 0 ]] || { echo "build/build.sh must run as root in the $BUILD_IMAGE container" >&2; exit 1; }
+grep -q '^ID=alpine' /etc/os-release 2>/dev/null || { echo "build/build.sh must run in the $BUILD_IMAGE container (musl): a glibc static build crashes resolving pool hostnames on other glibc versions" >&2; exit 1; }
+grep -q '^VERSION_ID=3\.24\.2$' /etc/os-release || echo "warning: not Alpine 3.24.2 ($BUILD_IMAGE); proceeding anyway" >&2
+
+DEPS=(build-base cmake git wget ca-certificates pkgconf autoconf automake libtool linux-headers perl python3 file binutils patch coreutils)
+apk add --no-cache -q "${DEPS[@]}" >/dev/null
 
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 DL="$W/dl"; DEPSDIR="$W/deps"; mkdir -p "$DL" "$DEPSDIR/include" "$DEPSDIR/lib"
@@ -130,6 +138,8 @@ CMAKEV=$(cmake --version | head -1)
 	echo "compiler.gxx=$GXXV"
 	echo "compiler.cmake=$CMAKEV"
 	echo "os=$(. /etc/os-release && echo "$PRETTY_NAME")"
+	echo "build_image=$BUILD_IMAGE"
+	echo "libc=musl $(/lib/ld-musl-x86_64.so.1 2>&1 | sed -n 's/^Version //p')"
 	echo "xmrig_sha256=$(sha256sum "$OUT/xmrig" | cut -d' ' -f1)"
 	echo "bloxsense_sha256=$(sha256sum "$OUT/bloxsense" | cut -d' ' -f1)"
 	for h in "${HELPERS[@]}"; do
@@ -139,8 +149,11 @@ CMAKEV=$(cmake --version | head -1)
 
 echo "built $OUT/xmrig and $OUT/bloxsense"
 cat "$OUT/build.provenance"
-echo "--- readelf -d (expect no NEEDED: both binaries are static) ---"
+echo "--- readelf (expect no NEEDED and no PT_INTERP: both binaries are fully static) ---"
 for b in xmrig bloxsense; do
 	echo "== $b =="
 	readelf -d "$OUT/$b" || true
+	if readelf -d "$OUT/$b" 2>/dev/null | grep -q NEEDED || readelf -l "$OUT/$b" | grep -q INTERP; then
+		echo "$b is not fully static - refusing" >&2; exit 1
+	fi
 done

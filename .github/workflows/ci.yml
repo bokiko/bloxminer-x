@@ -38,13 +38,17 @@ jobs:
 
   engine:
     # Builds the real xmrig/bloxsense binaries with the exact release recipe (build/build.sh itself refuses to
-    # run as anything but root/Ubuntu 22.04 - see its own header - so this runs under sudo, then hands ownership
-    # back to the runner user before anything downstream, including upload-artifact, needs to read the result).
+    # run anywhere but as root in its pinned Alpine/musl BUILD_IMAGE - see its own header - so this runs it in
+    # that container, then hands ownership back to the runner user before anything downstream, including
+    # upload-artifact, needs to read the result).
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: release build (same script as the published binary, as root)
-        run: sudo build/build.sh out
+      - name: release build (same script and container as the published binary, as root)
+        run: |
+          IMG=$(sed -n 's/^BUILD_IMAGE=//p' build/build.sh)
+          test -n "$IMG"
+          docker run --rm -v "$PWD":/src -w /src "$IMG" sh -c 'apk add --no-cache -q bash && bash build/build.sh out'
       - name: hand build output back to the runner user
         run: sudo chown -R "$(id -u):$(id -g)" out
       # xmrig/bloxsense are completely unmodified upstream XMRig (only the 0%-donate patch touches donate.h) -
@@ -102,6 +106,37 @@ jobs:
           sudo apt-get install -y -qq jq netcat-openbsd
       - name: HiveOS script tests (under load, real engine)
         run: BLOX_XMRIG_BIN="$PWD/out/xmrig" BLOX_BLOXSENSE_BIN="$PWD/out/bloxsense" tests/hive/test_under_load.sh
+
+  dns-real:
+    # 1.0.3 regression: the glibc-static xmrig crashed (SIGSEGV in getaddrinfo) resolving a pool hostname on
+    # Ubuntu 24.04 / Mint 22, whose glibc 2.39 NSS module mdns4_minimal it dlopen'ed. Run the REAL binary on
+    # both the HiveOS-like 22.04 and the 24.04 runner, with libnss-mdns installed (the exact crash condition).
+    needs: [engine]
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    env:
+      BLOX_REQUIRE_MDNS: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bloxminer-x-out
+          path: out
+      - name: restore the executable bit (artifact upload/download does not always preserve it)
+        run: chmod +x out/xmrig
+      - name: install libnss-mdns (adds mdns4_minimal to nsswitch.conf)
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -qq && break
+            echo "apt-get update failed (attempt $i/3), retrying..." >&2
+            sleep 5
+          done
+          sudo apt-get install -y -qq libnss-mdns
+          grep '^hosts:' /etc/nsswitch.conf
+      - name: xmrig resolves a pool hostname and stays up
+        run: tests/build/test_dns_resolve.sh out/xmrig
 
   package-provenance-real:
     # Packages the REAL build output above (never the `scripts` job's own synthetic fixture) with the real

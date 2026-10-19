@@ -13,7 +13,7 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Version-1.0.3-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.0.4-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/Based_on-XMRig_6.26.0-00599C?style=flat-square" alt="XMRig">
   <img src="https://img.shields.io/badge/Algorithm-RandomX-blue?style=flat-square" alt="RandomX">
   <img src="https://img.shields.io/badge/Platform-Linux_x86--64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
@@ -75,7 +75,7 @@ CPU miner, same HiveOS custom-miner packaging.
    - Miner name: `bloxminer-x`
    - Installation URL:
      ```
-     https://github.com/bokiko/bloxminer-x/releases/download/1.0.3/bloxminer-x-1.0.3.tar.gz
+     https://github.com/bokiko/bloxminer-x/releases/download/1.0.4/bloxminer-x-1.0.4.tar.gz
      ```
    - Hash algorithm: `randomx` (HiveOS's own name for Monero RandomX; `rx/0` is also accepted)
    - Wallet and worker template: `%WAL%.%WORKER_NAME%`
@@ -90,7 +90,7 @@ CPU miner, same HiveOS custom-miner packaging.
 |-------|-------|-------|
 | Miner | `custom` | Required |
 | Miner name | `bloxminer-x` | Must match exactly |
-| Installation URL | `https://github.com/bokiko/bloxminer-x/releases/download/1.0.3/bloxminer-x-1.0.3.tar.gz` | HiveOS installs it once and reuses it |
+| Installation URL | `https://github.com/bokiko/bloxminer-x/releases/download/1.0.4/bloxminer-x-1.0.4.tar.gz` | HiveOS installs it once and reuses it |
 | Hash algorithm | `randomx` | HiveOS's own name for Monero RandomX, same as what the flight-sheet dropdown writes; `rx/0` is also accepted (XMRig's own name for the same algo). Other RandomX-family coins: `randomx-arq` (or `rx/arq`), `randomx-grft` (or `rx/graft`), `randomx-sfx` (or `rx/sfx`) — HiveOS has no name for `rx/wow` or `rx/yada`, so those two must be typed exactly as shown. Case-insensitive, extra spaces are ignored |
 | Wallet template | `%WAL%.%WORKER_NAME%` | Your wallet.worker |
 | Pool URL | `stratum+tcp://host:port`, `stratum+ssl://host:port`, or plain `host:port` | Your pool (plain `host:port` defaults to `stratum+tcp://`) |
@@ -100,7 +100,7 @@ CPU miner, same HiveOS custom-miner packaging.
 ### HiveOS Terminal Install
 
 ```bash
-/hive/miners/custom/custom-get https://github.com/bokiko/bloxminer-x/releases/download/1.0.3/bloxminer-x-1.0.3.tar.gz
+/hive/miners/custom/custom-get https://github.com/bokiko/bloxminer-x/releases/download/1.0.4/bloxminer-x-1.0.4.tar.gz
 ```
 
 Then set the flight sheet as above. On a fresh HiveOS image, HiveOS installs its custom-miner support automatically
@@ -108,7 +108,7 @@ the first time a flight sheet uses a Custom miner.
 
 ### Updating
 
-Change the version in the Installation URL (e.g. `1.0.2` → `1.0.3`) and apply the flight sheet.
+Change the version in the Installation URL (e.g. `1.0.3` → `1.0.4`) and apply the flight sheet.
 HiveOS downloads the new package and restarts the miner. Your flight sheet fields stay the same.
 
 ---
@@ -257,9 +257,15 @@ After XMRig has stopped:
 ## Building from source
 
 ```bash
-build/build.sh [outdir]     # Ubuntu 22.04, run as root (a container or chroot) - see the script header
-build/package.sh <outdir> [pkgdir]
+IMG=$(sed -n 's/^BUILD_IMAGE=//p' build/build.sh)   # pinned Alpine (musl) image
+docker run --rm -v "$PWD":/src -w /src "$IMG" sh -c 'apk add --no-cache bash && bash build/build.sh out'
+build/package.sh out [pkgdir]
 ```
+
+Since 1.0.4 both binaries are built against **musl** (Alpine), not glibc. A glibc static binary still loads
+the host's own NSS modules to look up the pool hostname, and on a host with a different glibc (Ubuntu 24.04,
+Mint 22) that crashed XMRig with a segfault. musl has its own resolver and loads nothing from the host — the
+same libc XMRig's own official `linux-static` release uses.
 
 `build/build.sh` clones XMRig at the pinned tag (`v6.26.0`, commit `b2ca72480c58d197e18c885d9fc1a0c8d517e60a`),
 verifies the exact commit, applies [`build/donate0.patch`](build/donate0.patch) (the only source change), builds
