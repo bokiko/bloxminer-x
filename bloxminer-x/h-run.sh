@@ -38,9 +38,83 @@ if [[ ! -x ./xmrig ]]; then
 	exit 1
 fi
 
+# Startup banner: the same 4x5 core-grid "B" mark as BloxMiner's own blox_banner() (one amber "hot core"), with the
+# "-X" in that same amber as in assets/logo-*.svg. It is printed HERE, by the wrapper, and not from inside xmrig,
+# because the binary must stay unmodified upstream XMRig 6.26.0 plus donate0.patch (README "exactly one source
+# change"; build/build.sh refuses a patch that touches anything but src/donate.h). XMRig's own "ABOUT" header
+# still follows below it once exec'd.
+# Colour: SGR only when stdout is a terminal (Hive runs the miner in a `screen` pty) AND NO_COLOR is unset or
+# empty AND the terminal is known to support colour - `tput colors` when ncurses is present (8+ colours; -1 or
+# TERM=dumb -> plain), else a TERM-name fallback (screen*/tmux*/xterm*/linux). The 256-colour palette is used
+# when available, otherwise the 8-colour SGR codes BloxMiner itself falls back to (bright-black 100/90 - every
+# `screen` passes those through to the real terminal unchanged).
+# Log: the plain "##" form is appended to $CUSTOM_LOG_BASENAME.log BEFORE xmrig opens that file, which is what
+# makes it survive: XMRig's FileLogWriter tracks its own write offset from the file size at open time (no
+# O_APPEND - see h-stats.sh's header), so anything appended to that file AFTER xmrig starts gets overwritten,
+# while lines already present at open time are kept and Hive's start-time gzip rotation keeps them with the
+# rest of that run's log.
+# Failure tolerance: the call below is `|| true` with stderr dropped - an unwritable log or a closed stdout
+# produce no message and no non-zero status, so the banner can never turn a startable miner into a failed
+# start (also under an inherited `bash -e`). What this does NOT cover: a synchronous write that BLOCKS (a log
+# path on stalled storage, a FIFO nobody reads) blocks here exactly as it would block xmrig's own first log
+# write a moment later - no new failure mode, but not a guarded one either.
+blox_banner() {
+	local grid=("XXX." "X..X" "XXA." "X..X" "XXX.")   # the "B" core grid, A = hot core
+	local side=("" "RandomX CPU miner (Monero / XMR) - 0 % dev fee - GPL-3.0"
+	            "based on XMRig 6.26.0 (XMRig, SChernykh and contributors)"
+	            "https://github.com/bokiko/bloxminer-x" "")
+	local ncolors=0 cell='' hot='' acc='' dim='' bold='' rst=''
+	if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+		if command -v tput > /dev/null 2>&1; then
+			ncolors=$(tput colors 2>/dev/null) || ncolors=0
+			[[ $ncolors =~ ^-?[0-9]+$ ]] || ncolors=0
+		else
+			case ${TERM:-} in
+				*256color*) ncolors=256 ;;
+				screen*|tmux*|xterm*|linux) ncolors=8 ;;
+			esac
+		fi
+	fi
+	if (( ncolors >= 256 )); then
+		cell=$'\e[48;5;245m'; hot=$'\e[48;5;214m'; acc=$'\e[38;5;214m'; dim=$'\e[38;5;245m'
+	elif (( ncolors >= 8 )); then
+		cell=$'\e[100m'; hot=$'\e[43m'; acc=$'\e[33m'; dim=$'\e[90m'
+	else
+		ncolors=0
+	fi
+	(( ncolors )) && { rst=$'\e[0m'; bold=$'\e[1m'; }
+	local r c ch row plain
+	for r in 0 1 2 3 4; do
+		row=" "; plain=" "
+		for c in 0 1 2 3; do
+			ch=${grid[r]:c:1}
+			if [[ $ch == . ]]; then
+				row+="  "; plain+="  "
+			elif (( ncolors )); then
+				if [[ $ch == A ]]; then row+="$hot  $rst"; else row+="$cell  $rst"; fi; plain+="##"
+			else
+				row+="##"; plain+="##"
+			fi
+		done
+		if (( r == 0 )); then
+			row+="    ${bold}Blox${rst}${dim}Miner${rst}${acc}-X${rst} $CUSTOM_VERSION"
+			plain+="    BloxMiner-X $CUSTOM_VERSION"
+		elif [[ -n ${side[r]} ]]; then
+			if (( ncolors && r > 1 )); then row+="    ${dim}${side[r]}${rst}"; else row+="    ${side[r]}"; fi
+			plain+="    ${side[r]}"
+		fi
+		row=${row%"${row##*[! ]}"}; plain=${plain%"${plain##*[! ]}"}   # no trailing blanks from an empty grid cell
+		printf '%s\n' "$row" || return 0
+		printf '%s\n' "$plain" >> "$CUSTOM_LOG_BASENAME.log" || return 0
+	done
+	printf '\n'
+}
+blox_banner 2>/dev/null || true
+
 # XMRig runs directly on the HiveOS screen terminal; its own console output is plain lines + SGR colour. Its
-# log file (config "log-file" = $CUSTOM_LOG_BASENAME.log) is append-only - XMRig itself never rotates it; the
-# size bound comes from Hive's own start-time gzip rotation plus its 15-minute `logtruncateall` cron (20 MB).
+# log file (config "log-file" = $CUSTOM_LOG_BASENAME.log) only ever grows while it runs (XMRig writes at its own
+# tracked offset, see the banner note above) and XMRig itself never rotates it; the size bound comes from Hive's
+# own start-time gzip rotation plus its 15-minute `logtruncateall` cron (20 MB).
 # exec: Hive supervises the miner process itself and gets its exit status. On SUCCESS this replaces the
 # process image outright. `shopt -s execfail` covers the one remaining failure mode the `-x` check above
 # cannot catch: a present, executable, but not actually runnable binary (corrupt or wrong-architecture ELF) -
