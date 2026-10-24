@@ -15,6 +15,7 @@ sed -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/config.json#" \
     -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/log/bloxminer-x#" "$PKGSRC/h-manifest.conf" > "$BLOX_DIR/h-manifest.conf"
 mkdir -p "$T/log"   # h-run.sh creates this in production before the miner (and h-stats.sh) ever runs
 CONF=$T/config.json
+PKGVER=$(sed -n 's/^CUSTOM_VERSION=//p' "$PKGSRC/h-manifest.conf")   # the version h-stats.sh must report, from the manifest
 : > "$BLOX_DIR/xmrig"; chmod +x "$BLOX_DIR/xmrig"     # placeholder: only its path is ever compared, never run
 
 # ================================================================== h-config.sh
@@ -251,7 +252,7 @@ task "tmgmt" "0-31"   # a management thread keeping the full mask must not confu
 bloxsense_says "$(fake_topo_json 16)"
 stats_case "per-core grouping, 16C/32T, bound and verified" 20001 "$SUM_OK" "$BACK_16C32T" \
 	'(.stats.hs | length) == 16 and .stats.uptime == 321 and .stats.ar == [15, 1] and .stats.cpu_power == 95 and
-	 .stats.ver == "bloxminer-x 1.0.4 (xmrig 6.26.0)" and .stats.algo == "rx/0" and
+	 .stats.ver == "bloxminer-x '"$PKGVER"' (xmrig 6.26.0)" and .stats.algo == "rx/0" and
 	 (.stats.hs[0] == (((100 + 0) * 10 + (100 + 16) * 10) / 1000)) and (.stats.temp[0] == 55)'
 
 BACK_NULLS=$(python3 - <<'PY'
