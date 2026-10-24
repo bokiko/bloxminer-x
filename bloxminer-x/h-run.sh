@@ -53,11 +53,16 @@ fi
 # O_APPEND - see h-stats.sh's header), so anything appended to that file AFTER xmrig starts gets overwritten,
 # while lines already present at open time are kept and Hive's start-time gzip rotation keeps them with the
 # rest of that run's log.
-# Failure tolerance: the call below is `|| true` with stderr dropped - an unwritable log or a closed stdout
-# produce no message and no non-zero status, so the banner can never turn a startable miner into a failed
-# start (also under an inherited `bash -e`). What this does NOT cover: a synchronous write that BLOCKS (a log
-# path on stalled storage, a FIFO nobody reads) blocks here exactly as it would block xmrig's own first log
-# write a moment later - no new failure mode, but not a guarded one either.
+# Failure tolerance: the call below runs in a SUBSHELL, `|| true`, stderr dropped. An unwritable log or a
+# closed stdout produce no message and no non-zero status. The subshell matters for one case the `||`
+# operators cannot catch: stdout being a pipe whose reader is gone. The first write then raises SIGPIPE, and
+# a signal death is not a non-zero status - without the subshell it would kill this wrapper before the exec
+# (confirmed on Linux: rc -13, xmrig never started). Inside a subshell only the subshell dies; this shell
+# carries on to the exec, and xmrig inherits the default SIGPIPE disposition unchanged (no `trap` here, on
+# purpose - XMRig's own signal handling is not this script's business). So the banner can never turn a
+# startable miner into a failed start (also under an inherited `bash -e`). What this does NOT cover: a
+# synchronous write that BLOCKS (a log path on stalled storage, a FIFO nobody reads) blocks here exactly as it
+# would block xmrig's own first log write a moment later - no new failure mode, but not a guarded one either.
 blox_banner() {
 	local grid=("XXX." "X..X" "XXA." "X..X" "XXX.")   # the "B" core grid, A = hot core
 	local side=("" "RandomX CPU miner (Monero / XMR) - 0 % dev fee - GPL-3.0"
@@ -109,7 +114,7 @@ blox_banner() {
 	done
 	printf '\n'
 }
-blox_banner 2>/dev/null || true
+( blox_banner ) 2>/dev/null || true   # subshell: see "Failure tolerance" above (SIGPIPE)
 
 # XMRig runs directly on the HiveOS screen terminal; its own console output is plain lines + SGR colour. Its
 # log file (config "log-file" = $CUSTOM_LOG_BASENAME.log) only ever grows while it runs (XMRig writes at its own

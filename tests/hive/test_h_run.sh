@@ -103,6 +103,27 @@ out=$(bash -e "$BLOX_DIR/h-run.sh" 2>&1); rc=$?
 if [[ $rc == 0 ]] && [[ $(tail -1 <<< "$out") == FAKE_XMRIG* ]]; then ok "unwritable log under bash -e: miner still starts"; else bad "unwritable log under bash -e: miner still starts" "rc=$rc out=$out"; fi
 rmdir "$LOG"
 
+# stdout is a pipe whose reader is already gone (Codex PR review finding): the first banner write raises SIGPIPE.
+# Only the banner's subshell may die of it; the wrapper must still exec xmrig, with rc 0 from the fake xmrig.
+reset_log; : > "$T/started"; rm -f "$T/started"
+cat > "$T/fake_started.sh" <<X
+#!/usr/bin/env bash
+echo "FAKE_XMRIG \$*" >&2
+: > "$T/started"
+exit 0
+X
+chmod +x "$T/fake_started.sh"; mv "$BLOX_DIR/xmrig" "$BLOX_DIR/xmrig.real"; cp "$T/fake_started.sh" "$BLOX_DIR/xmrig"
+rc=$(python3 - "$BLOX_DIR/h-run.sh" <<'PY'
+import os, subprocess, sys
+r, w = os.pipe(); os.close(r)                      # a pipe with no reader, deterministically
+p = subprocess.run(["bash", sys.argv[1]], stdout=w, stderr=subprocess.DEVNULL)
+print(p.returncode)
+PY
+)
+if [[ $rc == 0 && -e $T/started ]]; then ok "stdout pipe with no reader (SIGPIPE): xmrig still starts, rc 0"; else bad "stdout pipe with no reader (SIGPIPE): xmrig still starts, rc 0" "rc=$rc started=$([[ -e $T/started ]] && echo yes || echo no)"; fi
+if [[ $( { wc -l < "$LOG"; } 2>/dev/null ) -le 5 ]]; then ok "stdout pipe with no reader: log has at most the banner rows, nothing else"; else bad "stdout pipe with no reader: log has at most the banner rows, nothing else" "log=$(cat "$LOG")"; fi
+mv "$BLOX_DIR/xmrig.real" "$BLOX_DIR/xmrig"
+
 # ------------------------------------------------------------------ no banner when the start is refused
 reset_log; CPUINFO=$T/cpuinfo.noaes run
 if [[ $rc == 1 ]] && has "$out" "needs an x86-64 CPU with AES-NI" && ! has "$out" "BloxMiner-X $VER" && ! has "$out" "FAKE_XMRIG" && has "$out" "SLEEP 60"; then ok "CPU without AES-NI: error, no banner, no exec, rc 1"; else bad "CPU without AES-NI: error, no banner, no exec, rc 1" "rc=$rc out=$out"; fi
