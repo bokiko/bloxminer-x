@@ -13,7 +13,7 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Version-1.0.4-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.0.5-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/Based_on-XMRig_6.26.0-00599C?style=flat-square" alt="XMRig">
   <img src="https://img.shields.io/badge/Algorithm-RandomX-blue?style=flat-square" alt="RandomX">
   <img src="https://img.shields.io/badge/Platform-Linux_x86--64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
@@ -75,7 +75,7 @@ CPU miner, same HiveOS custom-miner packaging.
    - Miner name: `bloxminer-x`
    - Installation URL:
      ```
-     https://github.com/bokiko/bloxminer-x/releases/download/1.0.4/bloxminer-x-1.0.4.tar.gz
+     https://github.com/bokiko/bloxminer-x/releases/download/1.0.5/bloxminer-x-1.0.5.tar.gz
      ```
    - Hash algorithm: `randomx` (HiveOS's own name for Monero RandomX; `rx/0` is also accepted)
    - Wallet and worker template: `%WAL%.%WORKER_NAME%`
@@ -90,7 +90,7 @@ CPU miner, same HiveOS custom-miner packaging.
 |-------|-------|-------|
 | Miner | `custom` | Required |
 | Miner name | `bloxminer-x` | Must match exactly |
-| Installation URL | `https://github.com/bokiko/bloxminer-x/releases/download/1.0.4/bloxminer-x-1.0.4.tar.gz` | HiveOS installs it once and reuses it |
+| Installation URL | `https://github.com/bokiko/bloxminer-x/releases/download/1.0.5/bloxminer-x-1.0.5.tar.gz` | HiveOS installs it once and reuses it |
 | Hash algorithm | `randomx` | HiveOS's own name for Monero RandomX, same as what the flight-sheet dropdown writes; `rx/0` is also accepted (XMRig's own name for the same algo). Other RandomX-family coins: `randomx-arq` (or `rx/arq`), `randomx-grft` (or `rx/graft`), `randomx-sfx` (or `rx/sfx`) — HiveOS has no name for `rx/wow` or `rx/yada`, so those two must be typed exactly as shown. Case-insensitive, extra spaces are ignored |
 | Wallet template | `%WAL%.%WORKER_NAME%` | Your wallet.worker |
 | Pool URL | `stratum+tcp://host:port`, `stratum+ssl://host:port`, or plain `host:port` | Your pool (plain `host:port` defaults to `stratum+tcp://`) |
@@ -100,7 +100,7 @@ CPU miner, same HiveOS custom-miner packaging.
 ### HiveOS Terminal Install
 
 ```bash
-/hive/miners/custom/custom-get https://github.com/bokiko/bloxminer-x/releases/download/1.0.4/bloxminer-x-1.0.4.tar.gz
+/hive/miners/custom/custom-get https://github.com/bokiko/bloxminer-x/releases/download/1.0.5/bloxminer-x-1.0.5.tar.gz
 ```
 
 Then set the flight sheet as above. On a fresh HiveOS image, HiveOS installs its custom-miner support automatically
@@ -108,7 +108,7 @@ the first time a flight sheet uses a Custom miner.
 
 ### Updating
 
-Change the version in the Installation URL (e.g. `1.0.3` → `1.0.4`) and apply the flight sheet.
+Change the version in the Installation URL (e.g. `1.0.4` → `1.0.5`) and apply the flight sheet.
 HiveOS downloads the new package and restarts the miner. Your flight sheet fields stay the same.
 
 ---
@@ -118,7 +118,7 @@ HiveOS downloads the new package and restarts the miner. Your flight sheet field
 HiveOS runs BloxMiner-X for you. Useful commands on the rig:
 
 ```bash
-miner                 # open the miner screen (Ctrl+A, D to leave) - XMRig's own console output
+miner                 # open the miner screen (Ctrl+A, D to leave) - the BloxMiner-X banner, then XMRig's own console output
 miner restart         # restart
 tail -f /var/log/miner/bloxminer-x/bloxminer-x.log     # XMRig's own log file
 ```
@@ -286,6 +286,8 @@ binaries without trusting this repo's binaries or re-deriving the patch themselv
 tests/bloxsense/run_tests.sh   # blox_sys.cpp unit tests + a bloxsense --json CLI smoke test, each run once
                                 # plain and once under ASan+UBSan (needs g++, jq)
 tests/hive/test_hive_scripts.sh   # h-config.sh / h-stats.sh behaviour against fake sysfs/procfs/API fixtures
+tests/hive/test_h_run.sh          # h-run.sh: startup banner (colour gate, log copy, failure tolerance), CPU gate,
+                                   # exec of xmrig with the right config and exit status (needs python3 for a pty)
 tests/hive/test_under_load.sh     # h-stats.sh under real CPU load, with a large fake /proc and with a real
                                    # xmrig --bench - proves the /proc scans stay fast under load, not just on
                                    # an idle box (needs nproc; the real-xmrig case needs ~/bxwork/out/xmrig)

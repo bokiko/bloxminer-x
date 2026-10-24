@@ -31,6 +31,8 @@ jobs:
         run: shellcheck -s bash bloxminer-x/h-config.sh bloxminer-x/h-run.sh bloxminer-x/h-stats.sh build/*.sh tests/*/*.sh
       - name: HiveOS script tests
         run: tests/hive/test_hive_scripts.sh
+      - name: h-run.sh tests (startup banner, CPU gate, exec)
+        run: tests/hive/test_h_run.sh
       - name: bloxsense tests
         run: tests/bloxsense/run_tests.sh
       - name: build package provenance tests
